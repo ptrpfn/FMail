@@ -1,0 +1,77 @@
+name: FMail
+
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: YES
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: "0.1"
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+
+targets:
+  FMail:
+    type: application
+    platform: macOS
+    sources:
+      - path: FMail
+        excludes:
+          - "Info.plist"
+    info:
+      path: FMail/Info.plist
+      properties:
+        CFBundleName: FMail
+        CFBundleDisplayName: FMail
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        CFBundlePackageType: APPL
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: "14.0"
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+        NSContactsUsageDescription: "FMail uses your contacts to suggest the right address when you reply, so you don't accidentally send to a contact's secondary or App-Store-only email."
+        NSAppleEventsUsageDescription: "FMail uses Mail.app to compose and send replies, so the reply opens in your familiar compose window with the right account, recipient, subject, and quoted body filled in."
+    settings:
+      base:
+        PRODUCT_NAME: FMail
+        PRODUCT_BUNDLE_IDENTIFIER: com.felixmatschke.FMail
+        ENABLE_APP_SANDBOX: NO
+
+  FMailTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: FMailTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.felixmatschke.FMailTests
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FMail.app/Contents/MacOS/FMail"
+    dependencies:
+      - target: FMail
+
+schemes:
+  FMail:
+    build:
+      targets:
+        FMail: all
+        FMailTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - FMailTests
+    archive:
+      config: Release
