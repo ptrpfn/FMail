@@ -56,6 +56,12 @@ final class MailModel {
     private(set) var contactsService = ContactsService()
     private var syncInFlight = false
     private var syncRequestedWhileBusy = false
+    /// When set in the future, FSEvents-triggered syncs are skipped until then.
+    /// Used by our own write-backs (Mark as Read etc.) to suppress the
+    /// follow-up sync that'd otherwise fire from Mail.app's `.emlx` flag-plist
+    /// modification — we've already updated our index optimistically, so the
+    /// re-mirror is wasted work.
+    private var skipSyncsUntil: Date?
     private var searchTask: Task<Void, Never>?
     private var bodyIndexerTask: Task<Void, Never>?
 
@@ -268,6 +274,11 @@ final class MailModel {
 
     func runIncrementalSync() async {
         guard let indexer else { return }
+        if let until = skipSyncsUntil, until > Date() {
+            // Our own writeback fired this. Skip — we've already updated locally.
+            return
+        }
+        skipSyncsUntil = nil
         if syncInFlight {
             syncRequestedWhileBusy = true
             return
@@ -565,6 +576,131 @@ final class MailModel {
     func startNewMail() {
         let req = ComposeRequest(to: [], cc: [], subject: "", body: "", inReplyTo: nil, references: [])
         _ = MailComposer.handOff(req)
+    }
+
+    // MARK: — Read-status writeback (AppleScript → Mail.app)
+
+    /// Optimistic-first read-status toggle. We:
+    ///   1. Apply the change to our own DB + every visible counter immediately
+    ///      so the UI is instant.
+    ///   2. Suppress the FSEvent-triggered sync that'd fire when Mail.app
+    ///      writes back to the `.emlx` flag plist (we already know what the
+    ///      result will be).
+    ///   3. Fire the AppleScript at Mail.app in the background, scoped to the
+    ///      message's canonical account + mailbox so Mail.app only scans that
+    ///      one mailbox. Wrapped in `ignoring application responses` so neither
+    ///      FMail nor the user's interaction with Mail.app gets blocked.
+    /// The next real sync (after the suppression window) reconciles in case
+    /// Mail.app couldn't apply the change.
+    func setReadStatus(_ message: MessageHeader, isRead: Bool) {
+        guard let rfcId = message.rfcMessageId, !rfcId.isEmpty else {
+            bodyError = "This message has no Message-ID header — can't ask Mail.app to mark it."
+            return
+        }
+
+        // Look up the canonical account+mailbox for a targeted AppleScript.
+        let mb = mailboxes.first { $0.rowId == message.mailboxRowId }
+        let acct = mb.flatMap { mb in accounts.first { $0.uuid == mb.accountUUID } }
+        let accountEmail = acct?.emailAddress
+        let mailboxPath = mb?.pathComponents
+
+        // Apply UI changes synchronously, FIRST.
+        skipSyncsUntil = Date().addingTimeInterval(30)
+        applyOptimisticReadFlag(messageRowId: message.rowId, isRead: isRead)
+
+        // Tell Mail.app to actually do it; don't wait.
+        MailScripter.setReadStatusFireAndForget(
+            rfcMessageId: rfcId,
+            isRead: isRead,
+            accountEmail: accountEmail,
+            mailboxPathComponents: mailboxPath
+        )
+    }
+
+    private func applyOptimisticReadFlag(messageRowId: Int, isRead: Bool) {
+        // Find the previous state of the message to compute a delta.
+        // If we don't have it in any of the in-memory lists, fall back to
+        // assuming a change happened so callers get immediate feedback.
+        var previousIsRead: Bool? = nil
+        var messageMailboxRowId: Int? = nil
+
+        // Update the in-thread message list.
+        if let idx = messagesInSelectedThread.firstIndex(where: { $0.rowId == messageRowId }) {
+            let m = messagesInSelectedThread[idx]
+            previousIsRead = m.isRead
+            messageMailboxRowId = m.mailboxRowId
+            messagesInSelectedThread[idx] = MessageHeader(
+                rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
+                senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
+                dateSent: m.dateSent, dateReceived: m.dateReceived,
+                isRead: isRead, isFlagged: m.isFlagged, rfcMessageId: m.rfcMessageId
+            )
+        }
+        // Update the search results list.
+        if let idx = searchResults.firstIndex(where: { $0.rowId == messageRowId }) {
+            let m = searchResults[idx]
+            if previousIsRead == nil { previousIsRead = m.isRead }
+            if messageMailboxRowId == nil { messageMailboxRowId = m.mailboxRowId }
+            searchResults[idx] = MessageHeader(
+                rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
+                senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
+                dateSent: m.dateSent, dateReceived: m.dateReceived,
+                isRead: isRead, isFlagged: m.isFlagged, rfcMessageId: m.rfcMessageId
+            )
+        }
+
+        // Compute delta for counters. If the state didn't actually change,
+        // skip everything below.
+        let stateChanged = (previousIsRead != isRead) && (previousIsRead != nil)
+        guard stateChanged else {
+            // Persist anyway in case our memory is stale relative to the DB.
+            if let db = indexDB {
+                Task { try? await db.setIsRead(rowid: messageRowId, isRead: isRead) }
+            }
+            return
+        }
+        let unreadDelta = isRead ? -1 : 1
+
+        // Update the currently-displayed thread summary's unreadCount.
+        if let tid = selectedThreadId,
+           let idx = threadsForSelectedMailbox.firstIndex(where: { $0.threadId == tid }) {
+            let s = threadsForSelectedMailbox[idx]
+            let newCount = max(0, s.unreadCount + unreadDelta)
+            threadsForSelectedMailbox[idx] = ThreadSummary(
+                threadId: s.threadId,
+                latestDateReceived: s.latestDateReceived,
+                messageCount: s.messageCount,
+                unreadCount: newCount,
+                flaggedCount: s.flaggedCount,
+                latestSubject: s.latestSubject,
+                latestSenderDisplay: s.latestSenderDisplay,
+                latestMessageRowId: s.latestMessageRowId
+            )
+        }
+
+        // Update the message's mailbox unread count in the sidebar.
+        // (Best-effort: only the canonical mailbox; Gmail label-mailbox
+        // counts may be off by one until the next real sync.)
+        if let mboxId = messageMailboxRowId,
+           let idx = mailboxes.firstIndex(where: { $0.rowId == mboxId }) {
+            let mb = mailboxes[idx]
+            let newUnread = max(0, mb.unreadCount + unreadDelta)
+            mailboxes[idx] = Mailbox(
+                rowId: mb.rowId, accountUUID: mb.accountUUID,
+                pathComponents: mb.pathComponents,
+                totalCount: mb.totalCount, unreadCount: newUnread,
+                hidden: mb.hidden, kind: mb.kind
+            )
+        }
+
+        // Update the global "All Mailboxes" badge + Dock tile.
+        allUnreadCount = max(0, allUnreadCount + unreadDelta)
+        updateDockBadge()
+
+        // Persist to our DB so it survives until the next sync confirms.
+        if let db = indexDB {
+            Task { try? await db.setIsRead(rowid: messageRowId, isRead: isRead) }
+        }
     }
 }
 

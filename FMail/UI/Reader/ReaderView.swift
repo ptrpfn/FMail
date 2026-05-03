@@ -43,7 +43,8 @@ struct ReaderView: View {
                             onTap: { model.selectMessage(msg) },
                             onReply: { model.startReply(kind: .reply, message: msg, body: model.bodyForSelectedMessage) },
                             onReplyAll: { model.startReply(kind: .replyAll, message: msg, body: model.bodyForSelectedMessage) },
-                            onForward: { model.startReply(kind: .forward, message: msg, body: model.bodyForSelectedMessage) }
+                            onForward: { model.startReply(kind: .forward, message: msg, body: model.bodyForSelectedMessage) },
+                            onToggleRead: { model.setReadStatus(msg, isRead: !msg.isRead) }
                         )
                     }
                 }
@@ -91,6 +92,7 @@ private struct MessageBlock: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
+    let onToggleRead: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -176,6 +178,15 @@ private struct MessageBlock: View {
                 Label("Forward", systemImage: "arrowshape.turn.up.right")
             }
             .keyboardShortcut("f", modifiers: [.command, .option])
+            Button(action: onToggleRead) {
+                Label(
+                    message.isRead ? "Mark as Unread" : "Mark as Read",
+                    systemImage: message.isRead ? "envelope.badge" : "envelope.open"
+                )
+            }
+            .keyboardShortcut("u", modifiers: [.command, .shift])
+            .help("Tells Mail.app to flip the read status of this message")
+            .disabled(message.rfcMessageId == nil || message.rfcMessageId?.isEmpty == true)
             if let rfcId = message.rfcMessageId, !rfcId.isEmpty {
                 Button {
                     _ = MailAppOpener.openMessage(rfcMessageId: rfcId)

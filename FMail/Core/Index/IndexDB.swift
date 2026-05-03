@@ -267,15 +267,15 @@ actor IndexDB {
             UPDATE mailboxes SET
                 total_count = (
                     SELECT COUNT(*) FROM (
-                        SELECT apple_rowid FROM messages WHERE messages.mailbox_rowid = mailboxes.apple_rowid
+                        SELECT m.apple_rowid FROM messages m WHERE m.mailbox_rowid = mailboxes.apple_rowid
                         UNION
                         SELECT message_rowid FROM message_labels WHERE message_labels.mailbox_rowid = mailboxes.apple_rowid
                     )
                 ),
                 unread_count = (
                     SELECT COUNT(*) FROM (
-                        SELECT apple_rowid FROM messages
-                          WHERE messages.mailbox_rowid = mailboxes.apple_rowid AND messages.is_read = 0
+                        SELECT m.apple_rowid FROM messages m
+                          WHERE m.mailbox_rowid = mailboxes.apple_rowid AND m.is_read = 0
                         UNION
                         SELECT m.apple_rowid FROM messages m
                           JOIN message_labels l ON l.message_rowid = m.apple_rowid
@@ -479,6 +479,17 @@ actor IndexDB {
         return arr
     }
 
+    /// Optimistic local update for is_read after a successful AppleScript
+    /// write to Mail.app. The next FSEvents-triggered sync confirms it.
+    func setIsRead(rowid: Int, isRead: Bool) throws {
+        var stmt: OpaquePointer?
+        try prepare("UPDATE messages SET is_read = ? WHERE apple_rowid = ?", into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, isRead ? 1 : 0)
+        bind(stmt, 2, Int64(rowid))
+        try stepDone(stmt)
+    }
+
     func threadId(forMessage rowid: Int) throws -> Int? {
         var stmt: OpaquePointer?
         try prepare("SELECT thread_id FROM messages WHERE apple_rowid = ?", into: &stmt)
@@ -504,6 +515,10 @@ actor IndexDB {
         var sql: String
         var bindings: [SQLBinding] = []
 
+        // Search always excludes drafts/trash/junk (canonical or label),
+        // matching the All Mailboxes view. To search inside one of those
+        // explicitly, navigate to that mailbox first — search is global
+        // by design.
         if !q.ftsExpression.isEmpty {
             // FTS5's MATCH operator requires the literal table name on the LHS;
             // an alias is interpreted as a column, hence the join uses the full
@@ -517,6 +532,7 @@ actor IndexDB {
             FROM messages_fts
             JOIN messages m ON m.apple_rowid = messages_fts.rowid
             WHERE messages_fts MATCH ?
+              AND \(Self.systemMailboxExcludeFilter)
             """
             bindings.append(.text(q.ftsExpression))
             if !q.sqlConditions.isEmpty {
@@ -533,6 +549,7 @@ actor IndexDB {
                    m.is_read, m.is_flagged, m.rfc_message_id
             FROM messages m
             WHERE \(q.sqlConditions)
+              AND \(Self.systemMailboxExcludeFilter)
             ORDER BY m.date_received DESC LIMIT ?
             """
             bindings.append(contentsOf: q.bindings)
@@ -619,26 +636,45 @@ actor IndexDB {
 
     /// Count of unread messages across the entire index, excluding
     /// drafts/trash/junk — badge for the "All Mailboxes" sidebar row.
+    /// Filters by *both* canonical mailbox kind *and* labels (Gmail's spam
+    /// lives canonically in `[Gmail]/All Mail` and is only marked spam via
+    /// a label in the `message_labels` table).
     func countAllUnreadExcludingDrafts() throws -> Int {
         var stmt: OpaquePointer?
         try prepare("""
-            SELECT COUNT(*) FROM messages
-            WHERE is_read = 0
-              AND mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))
+            SELECT COUNT(*) FROM messages m
+            WHERE m.is_read = 0
+              AND \(Self.systemMailboxExcludeFilter)
             """, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
+    /// SQL fragment that filters out messages whose canonical mailbox OR any
+    /// of its labels is a drafts / trash / junk / spam mailbox. Inlined into
+    /// every "user-facing list" query so junk-folder mail doesn't bleed into
+    /// global views.
+    private static let systemMailboxExcludeFilter = """
+        m.mailbox_rowid NOT IN (
+            SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk')
+        )
+        AND m.apple_rowid NOT IN (
+            SELECT message_rowid FROM message_labels
+            WHERE mailbox_rowid IN (
+                SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk')
+            )
+        )
+        """
+
     /// "All Mailboxes" view: every thread that contains at least one message
     /// outside drafts/trash/junk, newest first.
     func loadAllThreadSummaries(limit: Int = 500) throws -> [ThreadSummary] {
         let sql = """
         WITH visible AS (
-            SELECT apple_rowid, thread_id, date_received, is_read, is_flagged
-            FROM messages
-            WHERE mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))
+            SELECT m.apple_rowid, m.thread_id, m.date_received, m.is_read, m.is_flagged
+            FROM messages m
+            WHERE \(Self.systemMailboxExcludeFilter)
         ),
         thread_data AS (
             SELECT thread_id,
@@ -685,7 +721,7 @@ actor IndexDB {
         SELECT m.apple_rowid, m.subject_prefix, m.subject, COALESCE(m.sender_display, m.sender_address, '')
         FROM messages m
         WHERE m.thread_id = ?
-          AND m.mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))
+          AND \(Self.systemMailboxExcludeFilter)
         ORDER BY m.date_received DESC
         LIMIT 1
         """
@@ -775,17 +811,17 @@ actor IndexDB {
         case .includeAll:
             filter = ""
         case .excludeDrafts:
-            filter = " AND mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind = 'drafts')"
+            filter = " AND m.mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind = 'drafts')"
         case .excludeAllSystem:
-            filter = " AND mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))"
+            filter = " AND \(Self.systemMailboxExcludeFilter)"
         }
         let sql = """
-        SELECT apple_rowid, mailbox_rowid, subject, subject_prefix,
-               sender_address, sender_display, date_sent, date_received,
-               is_read, is_flagged, rfc_message_id
-        FROM messages
-        WHERE thread_id = ?\(filter)
-        ORDER BY date_received ASC
+        SELECT m.apple_rowid, m.mailbox_rowid, m.subject, m.subject_prefix,
+               m.sender_address, m.sender_display, m.date_sent, m.date_received,
+               m.is_read, m.is_flagged, m.rfc_message_id
+        FROM messages m
+        WHERE m.thread_id = ?\(filter)
+        ORDER BY m.date_received ASC
         """
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
