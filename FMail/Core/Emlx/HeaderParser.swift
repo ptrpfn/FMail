@@ -33,22 +33,26 @@ enum HeaderParser {
         let rawLines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
         // Fold continuation lines into a single logical line per header.
-        var logical: [String] = []
+        // Accumulate parts into a `[[String]]` and join once at the end —
+        // a `+=` per continuation is O(N²) in string copies and a malicious
+        // header with thousands of fold continuations would freeze parsing.
+        var groups: [[String]] = []
         for line in rawLines {
             if line.isEmpty { continue }
             if let f = line.first, f == " " || f == "\t" {
-                if !logical.isEmpty {
-                    logical[logical.count - 1] += " " + line.trimmingCharacters(in: .whitespaces)
+                if !groups.isEmpty {
+                    groups[groups.count - 1].append(line.trimmingCharacters(in: .whitespaces))
                 } else {
-                    logical.append(line)
+                    groups.append([line])
                 }
             } else {
-                logical.append(line)
+                groups.append([line])
             }
         }
 
         var entries: [(String, String)] = []
-        for line in logical {
+        for parts in groups {
+            let line = parts.joined(separator: " ")
             guard let colon = line.firstIndex(of: ":") else { continue }
             let name = String(line[..<colon]).lowercased().trimmingCharacters(in: .whitespaces)
             let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)

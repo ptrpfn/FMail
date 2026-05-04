@@ -16,16 +16,23 @@ struct MIMEContent {
 }
 
 enum MIMEParser {
+    /// Cap on multipart nesting. Real mail tops out around 5; anything beyond
+    /// this is a malformed or hostile message (parser bomb).
+    private static let maxMultipartDepth = 20
+
     /// Parses `bodyData` using the parsed top-level headers.
     static func parse(headers: ParsedHeaders, body: Data) -> MIMEContent {
         let ct = ContentType(headers["content-type"] ?? "text/plain; charset=us-ascii")
         let cte = (headers["content-transfer-encoding"] ?? "7bit").lowercased().trimmingCharacters(in: .whitespaces)
-        return parsePart(contentType: ct, transferEncoding: cte, body: body, partHeaders: headers)
+        return parsePart(contentType: ct, transferEncoding: cte, body: body, partHeaders: headers, depth: 0)
     }
 
-    private static func parsePart(contentType: ContentType, transferEncoding: String, body: Data, partHeaders: ParsedHeaders) -> MIMEContent {
+    private static func parsePart(contentType: ContentType, transferEncoding: String, body: Data, partHeaders: ParsedHeaders, depth: Int) -> MIMEContent {
         if contentType.major == "multipart", let boundary = contentType.parameters["boundary"] {
-            return parseMultipart(body: body, boundary: boundary, subtype: contentType.minor)
+            if depth >= maxMultipartDepth {
+                return MIMEContent(plainText: nil, html: nil, attachmentNames: [])
+            }
+            return parseMultipart(body: body, boundary: boundary, subtype: contentType.minor, depth: depth + 1)
         }
 
         // Single part.
@@ -53,7 +60,7 @@ enum MIMEParser {
         }
     }
 
-    private static func parseMultipart(body: Data, boundary: String, subtype: String) -> MIMEContent {
+    private static func parseMultipart(body: Data, boundary: String, subtype: String, depth: Int) -> MIMEContent {
         let parts = splitMultipart(body: body, boundary: boundary)
         var aggregatePlain: String?
         var aggregateHTML: String?
@@ -63,7 +70,7 @@ enum MIMEParser {
             let (partHeaders, partBody) = splitHeaderBody(partData)
             let partCT = ContentType(partHeaders["content-type"] ?? "text/plain")
             let partCTE = (partHeaders["content-transfer-encoding"] ?? "7bit").lowercased().trimmingCharacters(in: .whitespaces)
-            let parsed = parsePart(contentType: partCT, transferEncoding: partCTE, body: partBody, partHeaders: partHeaders)
+            let parsed = parsePart(contentType: partCT, transferEncoding: partCTE, body: partBody, partHeaders: partHeaders, depth: depth)
 
             if let p = parsed.plainText, aggregatePlain == nil {
                 aggregatePlain = p

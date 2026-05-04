@@ -63,10 +63,17 @@ enum EmlxParser {
         while lfIdx < bytes.count, bytes[lfIdx] != 0x0A { lfIdx += 1 }
         guard lfIdx < bytes.count else { return (data, Data()) }
         let prefix = String(bytes: bytes[0..<lfIdx], encoding: .ascii) ?? ""
-        guard let length = Int(prefix.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        guard let parsedLength = Int(prefix.trimmingCharacters(in: .whitespacesAndNewlines)),
+              parsedLength >= 0
+        else {
             return (data, Data())
         }
         let bodyStart = lfIdx + 1
+        // Clamp first: an attacker-supplied prefix near Int.max would trap on
+        // `bodyStart + parsedLength`. Clamping to remaining bytes makes the
+        // arithmetic safe and falls through to the "no trailer" path below.
+        let remaining = bytes.count - bodyStart
+        let length = min(parsedLength, max(0, remaining))
         guard bodyStart + length <= bytes.count else {
             return (Data(bytes[bodyStart...]), Data())
         }
