@@ -37,6 +37,29 @@ final class MailModel {
     var bodyError: String?
     var showHidden = false
 
+    /// Display order for the thread list (View → Sort Mails by). Persisted in
+    /// UserDefaults; `didSet` re-sorts the currently visible list so the
+    /// menu change is instant — no DB round-trip needed because the visible
+    /// set (latest 500 threads) is the same in either direction.
+    var messageSortOrder: MessageSortOrder = MessageSortOrder.loadFromDefaults(scope: .mail) {
+        didSet {
+            guard oldValue != messageSortOrder else { return }
+            messageSortOrder.persist(scope: .mail)
+            threadsForSelectedMailbox = sortThreads(threadsForSelectedMailbox)
+        }
+    }
+
+    /// Display order for messages within the currently open thread
+    /// (View → Sort Conversations by). Default `.oldest` keeps the original
+    /// message at the top.
+    var conversationSortOrder: MessageSortOrder = MessageSortOrder.loadFromDefaults(scope: .conversation) {
+        didSet {
+            guard oldValue != conversationSortOrder else { return }
+            conversationSortOrder.persist(scope: .conversation)
+            messagesInSelectedThread = sortConversation(messagesInSelectedThread)
+        }
+    }
+
     // Search
     var searchQuery: String = ""
     var searchInterpretation: String = ""
@@ -261,7 +284,7 @@ final class MailModel {
             // Update reader state without clearing the search list.
             selection = .mailbox(mb.rowId)
             selectedThreadId = threadId
-            messagesInSelectedThread = msgs
+            messagesInSelectedThread = sortConversation(msgs)
             isLoadingThreadMessages = false
             if let m = msgs.first(where: { $0.rowId == message.rowId }) {
                 selectMessage(m)
@@ -416,7 +439,7 @@ final class MailModel {
             }
             // Only commit results if the user hasn't navigated away.
             if selection == scope {
-                threadsForSelectedMailbox = threads
+                threadsForSelectedMailbox = sortThreads(threads)
                 isLoadingThreads = false
             }
         } catch {
@@ -447,9 +470,16 @@ final class MailModel {
         do {
             let msgs = try await db.loadThreadMessages(threadId: tid, scope: viewScope)
             if selectedThreadId == tid {
-                messagesInSelectedThread = msgs
+                messagesInSelectedThread = sortConversation(msgs)
                 isLoadingThreadMessages = false
-                if let latest = msgs.first(where: { $0.rowId == autoSelectLatest }) ?? msgs.last {
+                // Fallback uses max-by-date rather than `msgs.last` because the
+                // visible array order now depends on the user's
+                // conversationSortOrder — `last` is no longer always "newest".
+                let fallback = msgs.max { lhs, rhs in
+                    (lhs.dateReceived ?? lhs.dateSent ?? .distantPast)
+                        < (rhs.dateReceived ?? rhs.dateSent ?? .distantPast)
+                }
+                if let latest = msgs.first(where: { $0.rowId == autoSelectLatest }) ?? fallback {
                     selectMessage(latest)
                 }
             }
@@ -726,6 +756,55 @@ final class MailModel {
 enum SidebarSelection: Hashable, Sendable {
     case allMailboxes
     case mailbox(Int)
+}
+
+enum MessageSortOrder: String, CaseIterable, Sendable, Hashable {
+    case newest
+    case oldest
+
+    /// One persisted preference per axis. Defaults are deliberately different:
+    /// the mail (thread) list defaults newest-first (most-recent activity at
+    /// top); conversation messages default oldest-first (the original mail at
+    /// the top, replies below) — that's how Apple Mail and most clients show
+    /// a thread by default.
+    enum Scope: String {
+        case mail = "messageSortOrder"
+        case conversation = "conversationSortOrder"
+
+        var defaultValue: MessageSortOrder {
+            switch self {
+            case .mail: return .newest
+            case .conversation: return .oldest
+            }
+        }
+    }
+
+    static func loadFromDefaults(scope: Scope) -> MessageSortOrder {
+        let raw = UserDefaults.standard.string(forKey: scope.rawValue) ?? ""
+        return MessageSortOrder(rawValue: raw) ?? scope.defaultValue
+    }
+
+    func persist(scope: Scope) {
+        UserDefaults.standard.set(rawValue, forKey: scope.rawValue)
+    }
+}
+
+extension MailModel {
+    fileprivate func sortThreads(_ threads: [ThreadSummary]) -> [ThreadSummary] {
+        threads.sorted { lhs, rhs in
+            let l = lhs.latestDateReceived ?? .distantPast
+            let r = rhs.latestDateReceived ?? .distantPast
+            return messageSortOrder == .newest ? l > r : l < r
+        }
+    }
+
+    fileprivate func sortConversation(_ msgs: [MessageHeader]) -> [MessageHeader] {
+        msgs.sorted { lhs, rhs in
+            let l = lhs.dateReceived ?? lhs.dateSent ?? .distantPast
+            let r = rhs.dateReceived ?? rhs.dateSent ?? .distantPast
+            return conversationSortOrder == .newest ? l > r : l < r
+        }
+    }
 }
 
 struct ReplyDraft: Equatable, Sendable {
