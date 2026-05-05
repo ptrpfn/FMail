@@ -525,46 +525,55 @@ enum MailScripter {
         action: String,
         indent: String
     ) -> String {
+        // Empirical scaling of `whose id = X1 or id = X2 or …`:
+        //   1 ID:  ~4s   |   3 IDs: ~4s   |   5 IDs: ~5s
+        //   7 IDs: ~6s   |   8 IDs: ~30-75s (variable)
+        // There's a sharp non-linearity at 8+ OR terms — Mail.app's
+        // predicate evaluator falls over. Cap each chain at 5 IDs and
+        // emit multiple chains in sequence within the same mailbox match.
+        // For an 8-message batch in `[Gmail]/All Mail`: 2 chains × ~5s
+        // = ~10s, instead of the 30-75s a single 8-OR chain would take.
+        let chunkSize = 5
+        let uidChunks = uids.chunked(into: chunkSize)
+        let rfcChunks = rfcIds.chunked(into: chunkSize)
+
         var lines: [String] = []
         let hasUIDs = !uids.isEmpty
         let hasRfcIds = !rfcIds.isEmpty
         if hasUIDs {
-            // Batch all UIDs into ONE compound filter so the mailbox is
-            // scanned once instead of once-per-UID. `whose id is in {…}`
-            // errors out (Mail.app rejects the list specifier), but the
-            // OR-chain works. Mailbox scan is O(n) regardless of batch
-            // size, so a 50-message batch costs the same as a 1-message
-            // one — the big win for large selections.
-            //
             // Distinct variable (`mboxCountBefore`) avoids shadowing the
             // outer per-account `countBefore`.
-            let condition = uids.map { "id = \($0)" }.joined(separator: " or ")
             lines.append("set mboxCountBefore to foundCount")
-            lines.append("try")
-            lines.append("    set matches to (messages of \(mailboxRef) whose \(condition))")
-            lines.append("    repeat with msg in matches")
-            lines.append("        \(action)")
-            lines.append("        set foundCount to foundCount + 1")
-            lines.append("    end repeat")
-            lines.append("end try")
+            for chunk in uidChunks {
+                let condition = chunk.map { "id = \($0)" }.joined(separator: " or ")
+                lines.append("try")
+                lines.append("    set matches to (messages of \(mailboxRef) whose \(condition))")
+                lines.append("    repeat with msg in matches")
+                lines.append("        \(action)")
+                lines.append("        set foundCount to foundCount + 1")
+                lines.append("    end repeat")
+                lines.append("end try")
+            }
         }
         if hasRfcIds {
             // Slow Message-ID scan, only as a fallback when UID lookup
-            // missed (apple_rowid mismatch — rare). Same OR-chain batching.
-            let condition = rfcIds
-                .map { "message id = \"\(appleScriptEscape($0))\"" }
-                .joined(separator: " or ")
+            // missed (apple_rowid mismatch — rare).
             let openGuard = hasUIDs ? "if foundCount = mboxCountBefore then" : ""
             let closeGuard = hasUIDs ? "end if" : ""
             if !openGuard.isEmpty { lines.append(openGuard) }
             let bodyIndent = hasUIDs ? "    " : ""
-            lines.append("\(bodyIndent)try")
-            lines.append("\(bodyIndent)    set matches to (messages of \(mailboxRef) whose \(condition))")
-            lines.append("\(bodyIndent)    repeat with msg in matches")
-            lines.append("\(bodyIndent)        \(action)")
-            lines.append("\(bodyIndent)        set foundCount to foundCount + 1")
-            lines.append("\(bodyIndent)    end repeat")
-            lines.append("\(bodyIndent)end try")
+            for chunk in rfcChunks {
+                let condition = chunk
+                    .map { "message id = \"\(appleScriptEscape($0))\"" }
+                    .joined(separator: " or ")
+                lines.append("\(bodyIndent)try")
+                lines.append("\(bodyIndent)    set matches to (messages of \(mailboxRef) whose \(condition))")
+                lines.append("\(bodyIndent)    repeat with msg in matches")
+                lines.append("\(bodyIndent)        \(action)")
+                lines.append("\(bodyIndent)        set foundCount to foundCount + 1")
+                lines.append("\(bodyIndent)    end repeat")
+                lines.append("\(bodyIndent)end try")
+            }
             if !closeGuard.isEmpty { lines.append(closeGuard) }
         }
         return lines.map { indent + $0 }.joined(separator: "\n")
@@ -653,5 +662,17 @@ enum MailScripter {
             return "Diagnostic failed (exit \(exitCode)): \(stderr.isEmpty ? stdout : stderr)"
         }
         return stdout
+    }
+}
+
+private extension Array {
+    /// Splits the array into sub-arrays of at most `size` elements. The
+    /// final sub-array may be shorter. `chunked(into: 5)` on a 12-element
+    /// array yields three sub-arrays of sizes 5, 5, 2.
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
     }
 }
