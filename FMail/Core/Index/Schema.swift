@@ -4,7 +4,7 @@ import SQLite3
 /// FMail's own SQLite schema. Versioned via `schema_version` so future
 /// migrations can detect prior state and upgrade in place.
 enum Schema {
-    static let currentVersion: Int = 5
+    static let currentVersion: Int = 6
 
     /// Apply migrations to bring the DB up to `currentVersion`. Idempotent.
     static func apply(to db: OpaquePointer) throws {
@@ -27,6 +27,7 @@ enum Schema {
         if v < 3 { try migrateTo3(db) }
         if v < 4 { try migrateTo4(db) }
         if v < 5 { try migrateTo5(db) }
+        if v < 6 { try migrateTo6(db) }
     }
 
     static func currentSchemaVersion(_ db: OpaquePointer) -> Int {
@@ -158,6 +159,26 @@ enum Schema {
         case cc = 1
         case bcc = 2
         case from = 3
+    }
+
+    /// v6: mirror Apple's `messages.remote_id` (IMAP UID per canonical
+    /// mailbox) so AppleScript can use `whose id is N` for O(1) lookups
+    /// instead of the linear `whose message id is "..."` scan. Order-of-
+    /// magnitude faster Mark as Read on big mailboxes.
+    private static func migrateTo6(_ db: OpaquePointer) throws {
+        let statements = [
+            "ALTER TABLE messages ADD COLUMN imap_uid INTEGER;",
+            "CREATE INDEX idx_messages_imap_uid ON messages(imap_uid) WHERE imap_uid IS NOT NULL;",
+            "INSERT INTO schema_version(version, applied_at) VALUES (6, strftime('%s','now'));"
+        ]
+        try exec(db, "BEGIN TRANSACTION;")
+        do {
+            for s in statements { try exec(db, s) }
+            try exec(db, "COMMIT;")
+        } catch {
+            try? exec(db, "ROLLBACK;")
+            throw error
+        }
     }
 
     /// v5: recover from a pre-fix bug where every sync wiped FTS body content.

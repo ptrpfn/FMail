@@ -26,6 +26,12 @@ final class MailModel {
     /// Refreshed by `refreshFromIndexDB`.
     var allUnreadCount: Int = 0
     var selectedThreadId: Int?
+    /// Set of thread IDs currently selected in the thread list. Drives the
+    /// bulk-action bar (visible when count > 1) and row highlighting.
+    /// `selectedThreadId` (singular) is the one shown in the reader; for
+    /// single-selection both are aligned, for multi-selection only the
+    /// first/most-recent click drives the reader.
+    var selectedThreadIds: Set<Int> = []
     var selectedMessageId: Int?
     var threadsForSelectedMailbox: [ThreadSummary] = []
     var messagesInSelectedThread: [MessageHeader] = []
@@ -43,10 +49,11 @@ final class MailModel {
     var searchResults: [MessageHeader] = []
     var isSearching: Bool = false
     var searchError: String?
-    /// The search result the user clicked most recently. Bound to the
-    /// SearchResultsView's List selection so the row stays highlighted
-    /// (lighter shade once focus moves to the reader).
-    var selectedSearchResultId: Int?
+    /// The search results the user has selected. Set semantics so the user
+    /// can ⌘-click to multi-select for bulk Mark as Read / Unread. With
+    /// exactly one item selected, the reader opens that message; with more
+    /// selected, the bulk-action bar appears above the list.
+    var selectedSearchResultIds: Set<Int> = []
 
     private var indexDB: IndexDB?
     private var bodyLoader: BodyLoader?
@@ -149,6 +156,12 @@ final class MailModel {
             try await refreshFromIndexDB()
             loadState = .ready
 
+            // Default selection on launch: the "All Mailboxes" view, so the
+            // user lands on something useful instead of an empty middle pane.
+            if selection == nil {
+                selectAllMailboxes()
+            }
+
             // Background: refresh sync to catch anything new since last run.
             Task.detached { [weak self] in
                 guard let self else { return }
@@ -237,9 +250,62 @@ final class MailModel {
         searchQuery = ""
         searchInterpretation = ""
         searchResults = []
-        selectedSearchResultId = nil
+        selectedSearchResultIds = []
         isSearching = false
         searchError = nil
+    }
+
+    func markSelectedSearchResultsAsRead(_ isRead: Bool) {
+        let messages = searchResults.filter { selectedSearchResultIds.contains($0.rowId) }
+        guard !messages.isEmpty else { return }
+        setReadStatusForMessages(messages, isRead: isRead)
+    }
+
+    /// Batch Mark as Read for many messages at once. One osascript call
+    /// (grouped by mailbox), so Mail.app scans each mailbox once instead of
+    /// once-per-message. Optimistic UI updates fire immediately for every
+    /// message before osascript runs.
+    func setReadStatusForMessages(_ messages: [MessageHeader], isRead: Bool) {
+        // Optimistic per-message UI flip.
+        for msg in messages where msg.isRead != isRead {
+            applyOptimisticReadFlag(messageRowId: msg.rowId, isRead: isRead)
+        }
+
+        // Build batch entries. Prefer IMAP UID for AppleScript lookup
+        // (Mail.app indexes by id) and fall back to RFC Message-ID otherwise.
+        let entries: [MailScripter.BatchEntry] = messages.compactMap { msg in
+            let mb = mailboxes.first { $0.rowId == msg.mailboxRowId }
+            let acct = mb.flatMap { mb in accounts.first { $0.uuid == mb.accountUUID } }
+            // Need at least ONE of the two lookup keys.
+            guard msg.imapUID != nil || (msg.rfcMessageId.map { !$0.isEmpty } ?? false) else { return nil }
+            return MailScripter.BatchEntry(
+                rfcMessageId: msg.rfcMessageId ?? "",
+                imapUID: msg.imapUID,
+                accountEmail: acct?.emailAddress,
+                mailboxPathComponents: mb?.pathComponents
+            )
+        }
+        guard !entries.isEmpty else { return }
+
+        // Suppress sync long enough for the batch to land — one batch can
+        // take a while if it spans multiple Gmail accounts.
+        skipSyncsUntil = Date().addingTimeInterval(120)
+
+        Task.detached {
+            let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
+            switch result {
+            case .ok:
+                break
+            case .notFound:
+                await MainActor.run { [weak self] in
+                    self?.bodyError = "Mail.app couldn't find some of the selected messages — they may not have been downloaded yet."
+                }
+            case .failed(let msg):
+                await MainActor.run { [weak self] in
+                    self?.bodyError = "Bulk Mark as Read failed: \(msg)"
+                }
+            }
+        }
     }
 
     /// Open a specific message from search results in the reader. Keeps the
@@ -251,7 +317,7 @@ final class MailModel {
               let db = indexDB else { return }
 
         // Persist the row selection in the search list so the highlight stays.
-        selectedSearchResultId = message.rowId
+        selectedSearchResultIds = [message.rowId]
 
         Task { @MainActor in
             guard let threadId = try? await db.threadId(forMessage: message.rowId) else { return }
@@ -357,6 +423,7 @@ final class MailModel {
         selection = .allMailboxes
         threadsForSelectedMailbox = []
         selectedThreadId = nil
+        selectedThreadIds = []
         selectedMessageId = nil
         messagesInSelectedThread = []
         bodyForSelectedMessage = nil
@@ -370,6 +437,7 @@ final class MailModel {
         selection = .mailbox(mailbox.rowId)
         threadsForSelectedMailbox = []
         selectedThreadId = nil
+        selectedThreadIds = []
         selectedMessageId = nil
         messagesInSelectedThread = []
         bodyForSelectedMessage = nil
@@ -381,12 +449,56 @@ final class MailModel {
 
     func selectThread(_ thread: ThreadSummary) {
         selectedThreadId = thread.threadId
+        selectedThreadIds = [thread.threadId]
         selectedMessageId = nil
         messagesInSelectedThread = []
         bodyForSelectedMessage = nil
         bodyError = nil
         isLoadingThreadMessages = true
         Task { await loadMessagesForSelectedThread(autoSelectLatest: thread.latestMessageRowId) }
+    }
+
+    func toggleThreadSelection(_ thread: ThreadSummary) {
+        if selectedThreadIds.contains(thread.threadId) {
+            selectedThreadIds.remove(thread.threadId)
+        } else {
+            selectedThreadIds.insert(thread.threadId)
+        }
+    }
+
+    func selectThreadRange(anchorThreadId: Int, to clickedThreadId: Int) {
+        let threads = threadsForSelectedMailbox
+        guard let anchorIdx = threads.firstIndex(where: { $0.threadId == anchorThreadId }),
+              let thisIdx = threads.firstIndex(where: { $0.threadId == clickedThreadId })
+        else { return }
+        let range = anchorIdx <= thisIdx ? anchorIdx...thisIdx : thisIdx...anchorIdx
+        for i in range {
+            selectedThreadIds.insert(threads[i].threadId)
+        }
+    }
+
+    /// Mark every message in every currently-selected thread as read/unread.
+    /// Honors the active scope (e.g. excludes drafts/trash/junk in
+    /// All Mailboxes view) so we never accidentally flip a junk-folder
+    /// message just because it shares a thread with a real one.
+    func markSelectedThreadsAsRead(_ isRead: Bool) async {
+        guard let db = indexDB else { return }
+        let viewScope: IndexDB.ThreadViewScope
+        if isAllMailboxesScope {
+            viewScope = .excludeAllSystem
+        } else if let kind = selectedMailbox?.kind, ["drafts", "trash", "junk"].contains(kind) {
+            viewScope = .includeAll
+        } else {
+            viewScope = .excludeDrafts
+        }
+        var toFlip: [MessageHeader] = []
+        for tid in selectedThreadIds {
+            if let msgs = try? await db.loadThreadMessages(threadId: tid, scope: viewScope) {
+                toFlip.append(contentsOf: msgs.filter { $0.isRead != isRead })
+            }
+        }
+        guard !toFlip.isEmpty else { return }
+        setReadStatusForMessages(toFlip, isRead: isRead)
     }
 
     func selectMessage(_ message: MessageHeader) {
@@ -652,7 +764,8 @@ final class MailModel {
                 rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
                 senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
                 dateSent: m.dateSent, dateReceived: m.dateReceived,
-                isRead: isRead, isFlagged: m.isFlagged, rfcMessageId: m.rfcMessageId
+                isRead: isRead, isFlagged: m.isFlagged,
+                rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
             )
         }
         // Update the search results list.
@@ -664,7 +777,8 @@ final class MailModel {
                 rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
                 senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
                 dateSent: m.dateSent, dateReceived: m.dateReceived,
-                isRead: isRead, isFlagged: m.isFlagged, rfcMessageId: m.rfcMessageId
+                isRead: isRead, isFlagged: m.isFlagged,
+                rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
             )
         }
 

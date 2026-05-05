@@ -157,7 +157,8 @@ final class Indexer: Sendable {
             isRead: raw.isRead,
             isFlagged: raw.isFlagged,
             hasAttachment: raw.hasAttachment,
-            rfcMessageId: raw.rfcMessageId
+            rfcMessageId: raw.rfcMessageId,
+            imapUID: raw.imapUID
         )
     }
 
@@ -220,6 +221,7 @@ final class EnvelopeReadOnly {
         let isFlagged: Bool
         let hasAttachment: Bool
         let rfcMessageId: String?
+        let imapUID: Int?
     }
 
     struct RawRecipient {
@@ -373,7 +375,8 @@ final class EnvelopeReadOnly {
                m.date_sent, m.date_received,
                m.read, m.flagged,
                EXISTS(SELECT 1 FROM attachments at WHERE at.message = m.ROWID),
-               mgd.message_id_header
+               mgd.message_id_header,
+               m.remote_id
         FROM messages m
         JOIN mailboxes mb ON mb.ROWID = m.mailbox
         LEFT JOIN subjects s ON s.ROWID = m.subject
@@ -407,6 +410,8 @@ final class EnvelopeReadOnly {
             let flagged = sqlite3_column_int(stmt, 11) != 0
             let hasAtt = sqlite3_column_int(stmt, 12) != 0
             let rfcId = sqlite3_column_text(stmt, 13).map { String(cString: $0) }
+            let uidVal = sqlite3_column_int64(stmt, 14)
+            let uid: Int? = sqlite3_column_type(stmt, 14) == SQLITE_NULL ? nil : Int(uidVal)
 
             out.append(RawMessage(
                 rowId: rowid, messageIdHash: hash, mailboxRowId: mboxId, accountUUID: acct,
@@ -415,7 +420,8 @@ final class EnvelopeReadOnly {
                 dateSent: ds > 0 ? Int(ds) : nil,
                 dateReceived: dr > 0 ? Int(dr) : nil,
                 isRead: read, isFlagged: flagged, hasAttachment: hasAtt,
-                rfcMessageId: rfcId
+                rfcMessageId: rfcId,
+                imapUID: uid
             ))
         }
         return out

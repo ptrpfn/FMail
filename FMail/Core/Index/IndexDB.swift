@@ -121,9 +121,9 @@ actor IndexDB {
             subject, subject_prefix, subject_normalized,
             sender_address, sender_display,
             date_sent, date_received,
-            is_read, is_flagged, has_attachment, rfc_message_id
+            is_read, is_flagged, has_attachment, rfc_message_id, imap_uid
         )
-        VALUES (?,?,?,?, ?,?,?, ?,?, ?,?, ?,?,?,?)
+        VALUES (?,?,?,?, ?,?,?, ?,?, ?,?, ?,?,?,?,?)
         ON CONFLICT(apple_rowid) DO UPDATE SET
             mailbox_rowid = excluded.mailbox_rowid,
             account_uuid = excluded.account_uuid,
@@ -137,7 +137,8 @@ actor IndexDB {
             is_read = excluded.is_read,
             is_flagged = excluded.is_flagged,
             has_attachment = excluded.has_attachment,
-            rfc_message_id = excluded.rfc_message_id
+            rfc_message_id = excluded.rfc_message_id,
+            imap_uid = excluded.imap_uid
         """
         try inTransaction {
             var stmt: OpaquePointer?
@@ -160,6 +161,7 @@ actor IndexDB {
                 bind(stmt, 13, r.isFlagged ? 1 : 0)
                 bind(stmt, 14, r.hasAttachment ? 1 : 0)
                 bindOptional(stmt, 15, r.rfcMessageId)
+                bindOptional(stmt, 16, r.imapUID)
                 try stepDone(stmt)
             }
         }
@@ -545,7 +547,7 @@ actor IndexDB {
                    COALESCE(m.subject_prefix, '') || m.subject,
                    m.sender_address, m.sender_display,
                    m.date_sent, m.date_received,
-                   m.is_read, m.is_flagged, m.rfc_message_id
+                   m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
             FROM messages_fts
             JOIN messages m ON m.apple_rowid = messages_fts.rowid
             WHERE messages_fts MATCH ?
@@ -563,7 +565,7 @@ actor IndexDB {
                    COALESCE(m.subject_prefix, '') || m.subject,
                    m.sender_address, m.sender_display,
                    m.date_sent, m.date_received,
-                   m.is_read, m.is_flagged, m.rfc_message_id
+                   m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
             FROM messages m
             WHERE \(q.sqlConditions)
               AND \(Self.systemMailboxExcludeFilter)
@@ -597,12 +599,14 @@ actor IndexDB {
             let read = sqlite3_column_int(stmt, 7) != 0
             let flagged = sqlite3_column_int(stmt, 8) != 0
             let rfcId = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
+            let uidVal = sqlite3_column_int64(stmt, 10)
+            let uid: Int? = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : Int(uidVal)
             out.append(MessageHeader(
                 rowId: rowid, mailboxRowId: mboxId, subject: subject,
                 senderAddress: sa, senderDisplay: sd,
                 dateSent: ds > 0 ? Date(timeIntervalSince1970: TimeInterval(ds)) : nil,
                 dateReceived: dr > 0 ? Date(timeIntervalSince1970: TimeInterval(dr)) : nil,
-                isRead: read, isFlagged: flagged, rfcMessageId: rfcId
+                isRead: read, isFlagged: flagged, rfcMessageId: rfcId, imapUID: uid
             ))
         }
         return out
@@ -835,7 +839,7 @@ actor IndexDB {
         let sql = """
         SELECT m.apple_rowid, m.mailbox_rowid, m.subject, m.subject_prefix,
                m.sender_address, m.sender_display, m.date_sent, m.date_received,
-               m.is_read, m.is_flagged, m.rfc_message_id
+               m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
         FROM messages m
         WHERE m.thread_id = ?\(filter)
         ORDER BY m.date_received ASC
@@ -943,6 +947,8 @@ actor IndexDB {
             let read = sqlite3_column_int(stmt, 8) != 0
             let flagged = sqlite3_column_int(stmt, 9) != 0
             let rfcId = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
+            let uidVal = sqlite3_column_int64(stmt, 11)
+            let uid: Int? = sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : Int(uidVal)
             out.append(MessageHeader(
                 rowId: rowid,
                 mailboxRowId: mailboxRowId,
@@ -953,7 +959,8 @@ actor IndexDB {
                 dateReceived: dr > 0 ? Date(timeIntervalSince1970: TimeInterval(dr)) : nil,
                 isRead: read,
                 isFlagged: flagged,
-                rfcMessageId: rfcId
+                rfcMessageId: rfcId,
+                imapUID: uid
             ))
         }
         return out
@@ -1072,6 +1079,7 @@ struct IndexedMessage {
     let isFlagged: Bool
     let hasAttachment: Bool
     let rfcMessageId: String?
+    let imapUID: Int?
 }
 
 struct IndexedRecipient {

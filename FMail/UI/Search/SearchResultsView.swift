@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct SearchResultsView: View {
@@ -20,20 +21,99 @@ struct SearchResultsView: View {
                 description: Text("Try a broader query or different operators.")
             )
         } else {
-            List(selection: Binding(
-                get: { model.selectedSearchResultId },
-                set: { newId in
-                    if let newId, let m = model.searchResults.first(where: { $0.rowId == newId }) {
-                        model.openFromSearch(m)
-                    }
+            VStack(spacing: 0) {
+                if model.selectedSearchResultIds.count > 1 {
+                    BulkActionBar(model: model)
+                    Divider()
                 }
-            )) {
-                ForEach(model.searchResults) { msg in
-                    SearchResultRow(message: msg, mailboxes: model.mailboxes)
-                        .tag(msg.rowId)
+                // Manual click handling instead of `List(selection:)` —
+                // multi-select inside NavigationSplitView's content column is
+                // flaky, especially because opening the reader steals focus
+                // away from the List which then ignores ⌘-click.
+                // Reading `NSEvent.modifierFlags` at click time is reliable.
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.searchResults) { msg in
+                            row(for: msg)
+                            Divider()
+                        }
+                    }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func row(for msg: MessageHeader) -> some View {
+        let isSelected = model.selectedSearchResultIds.contains(msg.rowId)
+        SearchResultRow(message: msg, mailboxes: model.mailboxes)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                handleTap(msg)
+            }
+    }
+
+    private func handleTap(_ msg: MessageHeader) {
+        let mods = NSEvent.modifierFlags
+        if mods.contains(.command) {
+            // ⌘-click: toggle this row in the selection without opening.
+            if model.selectedSearchResultIds.contains(msg.rowId) {
+                model.selectedSearchResultIds.remove(msg.rowId)
+            } else {
+                model.selectedSearchResultIds.insert(msg.rowId)
+            }
+        } else if mods.contains(.shift) {
+            // ⇧-click: range-select from the first selected (anchor) to here.
+            if let anchorId = model.selectedSearchResultIds.first,
+               let anchorIdx = model.searchResults.firstIndex(where: { $0.rowId == anchorId }),
+               let thisIdx = model.searchResults.firstIndex(where: { $0.rowId == msg.rowId }) {
+                let range = anchorIdx <= thisIdx ? anchorIdx...thisIdx : thisIdx...anchorIdx
+                for i in range {
+                    model.selectedSearchResultIds.insert(model.searchResults[i].rowId)
+                }
+            } else {
+                model.selectedSearchResultIds = [msg.rowId]
+                model.openFromSearch(msg)
+            }
+        } else {
+            // Plain click: replace selection and open in reader.
+            model.selectedSearchResultIds = [msg.rowId]
+            model.openFromSearch(msg)
+        }
+    }
+}
+
+private struct BulkActionBar: View {
+    @Bindable var model: MailModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("\(model.selectedSearchResultIds.count) selected")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                model.markSelectedSearchResultsAsRead(true)
+            } label: {
+                Label("Mark as Read", systemImage: "envelope.open")
+            }
+            Button {
+                model.markSelectedSearchResultsAsRead(false)
+            } label: {
+                Label("Mark as Unread", systemImage: "envelope.badge")
+            }
+            Button("Clear") {
+                model.selectedSearchResultIds = []
+            }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.1))
     }
 }
 

@@ -31,10 +31,13 @@ FMail reads Apple Mail's `~/Library/Mail/V*/` store **read-only**, mirrors the m
 - **Search DSL** — `from:kyoko after:2024-03 (invoice OR receipt) -draft has:attachment "exact phrase"`. Date forms include ISO, relative (`7d`, `last week`), month names, and a `during:` operator that auto-widens to the granularity you typed (`during:2026` = all of 2026).
 - **Per-contact preferred address** — never mis-send to a contact's secondary address again.
 - **Threads via union-find** on `Message-ID` / `In-Reply-To` / `References`.
-- **"All Mailboxes" view** across every account, with drafts / trash / junk filtered out.
+- **"All Mailboxes" view** across every account, with drafts / trash / junk filtered out. Auto-selected on launch. Dock badge shows the global unread count.
 - **Mail.app's threading still works** — replies set proper `In-Reply-To` and `References` headers via RFC 6068 mailto parameters.
+- **HTML emails render natively** in a locked-down WKWebView. Strict Content-Security-Policy blocks all network — no read-tracking pixels, no remote-image leaks.
+- **Per-message "Load remote images" button** for newsletters with graphs etc. Opt-in only, ephemeral (resets when you re-open the email).
 - **"Open in Mail.app" button** for messages whose body Mail.app hasn't downloaded yet (uses the `message://` URL scheme).
-- **Zero network connections.** No outbound traffic, no telemetry.
+- **Mark as Read / Mark as Unread** via Mail.app (AppleScript) — Mail.app still gets the change so it propagates to the IMAP server.
+- **Zero network connections by default.** No outbound traffic, no telemetry. The only network FMail ever makes is when you explicitly click "Load remote images" on a specific message.
 - **Apple's Gmail label model handled** — `[Gmail]/All Mail` is the canonical store, INBOX/Sent/Important are labels; FMail mirrors the labels table and shows them correctly.
 
 ## Status

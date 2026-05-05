@@ -129,7 +129,7 @@ User-typed query is parsed into a structured form. Examples:
 
 **Operators**: `AND` (implicit), `OR`, `-` / `NOT`, parentheses, quoted phrases.
 
-**Field operators**: `from:`, `to:`, `cc:`, `subject:`, `body:`, `attachment:`, `account:`, `in:`, `has:`, `is:`, `before:`, `after:` / `since:`, `on:`, `during:`. No-colon shortcuts: `hasattachment`, `isunread`, `isread`, `isflagged`.
+**Field operators**: `from:`, `to:`, `cc:`, `subject:`, `body:` (or `content:`, `text:`), `attachment:`, `account:`, `in:`, `has:`, `is:`, `before:`, `after:` / `since:`, `on:`, `during:`. No-colon shortcuts: `hasattachment`, `isunread`, `isread`, `isflagged`.
 
 **Date forms accepted**:
 - ISO: `2024-03-15`, `2024-03`, `2024`
@@ -187,11 +187,13 @@ Single-column stacked thread reader (v1 — two-column variant deferred). Each m
 - **Read messages are collapsed by default** to a one-line summary (sender · date · first 60 chars). ✅
 - **Time deltas**: between consecutive messages, show "+3 days" / "+12 min" so you can see the rhythm of the conversation. ✅
 - **Reply target indicator**: when you hit ⌘R, FMail shows in the compose-launch dialog *which* message you're replying to and *which* address it's going to (lets you catch a wrong-address selection before it's too late). ✅
+- **HTML rendering**: HTML message bodies render in a locked-down `WKWebView` with strict `Content-Security-Policy` (`default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'`). No network calls — no read-tracking pixels, no remote font/script/iframe loads. Plain-text bodies fall back to a `Text` view. ✅
+- **Per-message "Load remote images" opt-in**: when an HTML message contains `<img src="http(s)://…">`, a button appears above the body. Clicking it relaxes CSP for *that message instance only* to allow `img-src http: https:` (scripts/iframes/fonts stay blocked even then). The choice is per-instance and not persisted — re-opening the same email starts blocked again. ✅
 
 Deferred to Phase 5:
 - **`N` keyboard shortcut**: jump to next unread message *within this thread*; then next unread *across threads*.
 - **Quote folding**: `> > >` history blocks collapsed by default with "show quoted text" toggle.
-- **Inline images**: bodies render as HTML-stripped plain text; no inline images. Re-enabling requires a non-WebKit renderer.
+- **`cid:` inline-attached images**: CSP already allows them; the resolver that maps `cid:foo` to the corresponding bundled attachment isn't wired yet.
 - **Two-column variant** (list of messages on the left, currently-selected message on the right) as an alternative layout.
 
 ## 9. Robustness against Apple changing things
@@ -209,7 +211,8 @@ The `~/Library/Mail/V*/` path and Envelope Index schema are private API in spiri
 - **Min target**: macOS 14 (Sonoma).
 - **Storage**: **Raw `SQLite3` C API** (decision: zero new deps; GRDB was the spec's first choice but raw works fine for our schema size).
 - **Mail parsing**: hand-rolled `.emlx` parser (~250 LoC across `EmlxParser` + `MIMEParser` + `EncodedWord` + `HeaderParser`). Handles RFC 822 line folding, RFC 2047 encoded-words, multipart MIME, base64, quoted-printable.
-- **HTML → text**: **custom `HTMLStripper`** (decision: avoiding `NSAttributedString(html:)` because it pulls in WebKit, would auto-fetch remote images, and tanks reindex performance at 150k messages).
+- **HTML → text** (for indexing): **custom `HTMLStripper`** (decision: avoiding `NSAttributedString(html:)` because it pulls in WebKit, would auto-fetch remote images, and tanks reindex performance at 150k messages).
+- **HTML rendering** (for the reader): **`WKWebView`** wrapped in `NSViewRepresentable`, with strict CSP and `allowsContentJavaScript = false`. Height auto-measured via `evaluateJavaScript("document.documentElement.scrollHeight")`. Content cached per (html, allowRemoteImages) to avoid feedback-loop reloads when SwiftUI re-renders for unrelated reasons.
 - **Compose**: **`mailto:` URL via `NSWorkspace.shared.open(_:)`** (decision: simpler than AppleScript, no Automation permission, RFC 6068 supports `subject` / `body` / `cc` / `in-reply-to` / `references`). Trade-off: Mail.app picks the From-account by heuristic. AppleScript path is a Phase 5 polish if needed.
 - **Project shape**: single Xcode app target driven by **`xcodegen`** (`project.yml` checked in; `.xcodeproj` regenerated, gitignored).
 - **Contacts**: `Contacts.framework`.
@@ -261,16 +264,28 @@ Each phase is a usable app. Per-phase status here is the design intent; for what
 - **Closes pain point #3.** Pain point #4 mostly closed; remaining items in Phase 5.
 
 ### Phase 5 — Polish (ongoing) 🚧
-Targets (see IMPLEMENTATION.md for full list with rough effort):
+Already shipped (per IMPLEMENTATION.md):
+- "All Mailboxes" virtual view with global unread count + Dock-tile badge, auto-selected on launch.
+- HTML rendering via locked-down `WKWebView`; per-message "Load remote images" opt-in.
+- App icon (multi-size `AppIcon.icns`).
+- Mark as Read / Mark as Unread via AppleScript (osascript subprocess, targeted, fire-and-forget so Mail.app doesn't lock up).
+- "Open in Mail.app" via `message://` URL scheme — handles "body not yet downloaded" cases.
+- Reply toolbar moved to top of each message.
+- Body-text loss bug fixed (incremental FTS update; Schema v5 reset to recover existing data).
+- Search excludes drafts/trash/junk consistently (canonical + Gmail-label filter).
+- DSL aliases: `during:`, `content:`/`text:` for body, `hasattachment`/`isunread`/etc as no-colon shortcuts.
+
+Remaining targets:
 - Saved searches, keyboard shortcuts (`J`/`K`/`N`), quote folding, Quick Look on attachments.
-- True incremental sync (currently full re-mirror per FSEvent).
-- Body indexer that picks up new mail from FSEvents.
+- True incremental sync (currently full re-mirror per FSEvent; works but wasteful).
+- Body indexer that picks up new mail discovered by FSEvents.
 - Settings pane for address overrides.
 - DSL tests + schema-fingerprint test against live Envelope Index.
 - Sandbox attempt.
 - AppleScript compose path (for "send from this account" precision).
-- iCloud alias unification.
+- iCloud alias unification (`@me.com` ≡ `@icloud.com` ≡ `@mac.com`).
 - Natural-language fallback (§6.3).
+- `cid:` inline image resolution.
 
 **Stop conditions** (any of these → declare done, resist scope creep):
 - You've used FMail as your daily reader for a month and the original four pain points are gone.

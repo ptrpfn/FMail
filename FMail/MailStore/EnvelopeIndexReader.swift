@@ -150,7 +150,8 @@ final class EnvelopeIndexReader {
                 dateReceived: dateRecvTs > 0 ? Date(timeIntervalSince1970: TimeInterval(dateRecvTs)) : nil,
                 isRead: read,
                 isFlagged: flagged,
-                rfcMessageId: nil
+                rfcMessageId: nil,
+                imapUID: nil
             ))
         }
         return out

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MessageListView: View {
@@ -43,20 +44,87 @@ struct MessageListView: View {
                 description: Text("This mailbox has no messages.")
             )
         } else {
-            List(selection: Binding(
-                get: { model.selectedThreadId },
-                set: { newId in
-                    if let newId, let t = model.threadsForSelectedMailbox.first(where: { $0.threadId == newId }) {
-                        model.selectThread(t)
-                    }
+            VStack(spacing: 0) {
+                if model.selectedThreadIds.count > 1 {
+                    ThreadBulkActionBar(model: model)
+                    Divider()
                 }
-            )) {
-                ForEach(model.threadsForSelectedMailbox) { thread in
-                    ThreadRow(thread: thread)
-                        .tag(thread.threadId)
+                // Manual click handling — same reason as SearchResultsView:
+                // List(selection: Set<T>) is unreliable inside
+                // NavigationSplitView's content column, especially when
+                // opening the reader on click steals focus.
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.threadsForSelectedMailbox) { thread in
+                            threadRow(for: thread)
+                            Divider()
+                        }
+                    }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func threadRow(for thread: ThreadSummary) -> some View {
+        let isSelected = model.selectedThreadIds.contains(thread.threadId)
+        ThreadRow(thread: thread)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                handleThreadTap(thread)
+            }
+    }
+
+    private func handleThreadTap(_ thread: ThreadSummary) {
+        let mods = NSEvent.modifierFlags
+        if mods.contains(.command) {
+            // ⌘-click: toggle without opening.
+            model.toggleThreadSelection(thread)
+        } else if mods.contains(.shift) {
+            // ⇧-click: range-select from anchor (first selected) to here.
+            if let anchor = model.selectedThreadIds.first {
+                model.selectThreadRange(anchorThreadId: anchor, to: thread.threadId)
+            } else {
+                model.selectThread(thread)
+            }
+        } else {
+            // Plain click: replace and open in reader.
+            model.selectThread(thread)
+        }
+    }
+}
+
+private struct ThreadBulkActionBar: View {
+    @Bindable var model: MailModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("\(model.selectedThreadIds.count) threads selected")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                Task { await model.markSelectedThreadsAsRead(true) }
+            } label: {
+                Label("Mark Read", systemImage: "envelope.open")
+            }
+            Button {
+                Task { await model.markSelectedThreadsAsRead(false) }
+            } label: {
+                Label("Mark Unread", systemImage: "envelope.badge")
+            }
+            Button("Clear") {
+                model.selectedThreadIds = []
+            }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.1))
     }
 }
 

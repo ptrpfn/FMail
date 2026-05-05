@@ -13,7 +13,7 @@ Last updated: 2026-05-03.
 | #1 Drifting unread counts | **Solved** | Phase 1 (compute from `.emlx` flags), refined in Phase 2 (recompute from our own DB on every sync) |
 | #2 Weak search | **Solved** | Phase 3 (FTS5 + DSL with `from:` / `to:` / `subject:` / `body:` / `before:` / `after:` / `during:` / `is:` / `has:` / boolean / phrases) |
 | #3 Wrong recipient address | **Solved** | Phase 4 (Contacts integration + per-contact preferred-address overrides + reply confirmation dialog) |
-| #4 Illegible thread view | **Mostly solved** | Phase 2 (threading via union-find on Apple's `message_references`) + Phase 3 (single-column stacked thread reader with time-deltas, expand-on-click, unread tinting). Spec §8 items still open: quote folding, `N` next-unread shortcut, two-column variant, inline images |
+| #4 Illegible thread view | **Mostly solved** | Phase 2 (threading via union-find on Apple's `message_references`) + Phase 3 (single-column stacked thread reader with time-deltas, expand-on-click, unread tinting) + Phase 5 (HTML rendering in locked-down WKWebView). Spec §8 items still open: quote folding, `N` next-unread shortcut, two-column variant, `cid:` inline-image resolution. |
 
 FMail is daily-driver capable today. Remaining work is Phase 5 polish.
 
@@ -125,17 +125,20 @@ Bug fixes during Phase 4:
 - Empty quote lines now `>` (not `> `) — matches convention.
 
 ### Phase 5 — Polish (ongoing) 🚧
-Items already shipped that the original spec put in Phase 5:
+Items already shipped that the original spec put in Phase 5 (chronological-ish order):
 - `during:` operator (above and beyond original DSL).
-- Per-account email address detection.
+- Per-account email address detection (Sent-mailbox heuristic + recipient-of-incoming fallback).
 - Persistent search-result selection.
-- "All Mailboxes" virtual mailbox at top of sidebar with global unread count + Dock-tile badge.
+- "All Mailboxes" virtual mailbox at top of sidebar with global unread count + Dock-tile badge. Auto-selected on launch.
 - Drafts/Trash/Junk filtered from "All Mailboxes" + global search results (canonical mailbox + Gmail label).
 - App icon (`AppIcon.icns`, multi-size, built via `iconutil`).
-- "Open in Mail.app" button per message via `message://` URL scheme — handles "body not yet downloaded" cases.
+- "Open in Mail.app" button per message via `message://` URL scheme — handles "body not yet downloaded" cases. Schema v4 added `rfc_message_id` mirrored from `message_global_data` (FK is `messages.global_message_id` → `mgd.ROWID`).
 - Reply toolbar moved to top of each expanded message (so long footers don't push it off-screen).
-- **Mark as Read / Mark as Unread** via AppleScript (`osascript` subprocess, targeted to the canonical mailbox to keep Mail.app's lockup window minimal). Optimistic-first: FMail's UI updates instantly; sync is suppressed for 30s to avoid full re-mirror; `osascript` runs in background.
+- **Mark as Read / Mark as Unread** via AppleScript (`osascript` subprocess, targeted to the canonical mailbox to keep Mail.app's lockup window minimal). Optimistic-first: FMail's UI updates instantly; sync is suppressed for 30s to avoid full re-mirror; `osascript` runs in background. Permission-denied (-1743) errors surface a one-click button that opens System Settings → Privacy → Automation.
 - Body-text loss bug fixed: incremental FTS update (don't wipe + reinsert each sync); Schema v5 reset of `body_indexed` to recover existing data.
+- DSL aliases added for body search (`content:`, `text:`).
+- **HTML body rendering** via locked-down `WKWebView` (`Core/UI/Reader/HTMLBodyView.swift`). Strict CSP blocks all network — no tracking pixels, no remote images, no scripts, no fonts. Height auto-measured via `evaluateJavaScript` so the WebView fits naturally inside the outer `ScrollView`. Reload guarded against feedback loops (compares last-loaded `(html, allowRemoteImages)` before reloading).
+- **Per-message "Load remote images"** opt-in. CSP relaxes to `img-src data: cid: http: https:` for that one message instance; scripts/iframes/fonts stay blocked. Per-instance state, not persisted — re-opening the same email starts blocked again.
 
 Remaining (see "Open work" below).
 
@@ -155,9 +158,9 @@ These are intentional choices made during implementation; the spec hasn't been e
 | §8 | Two-column thread reader option | Single-column stacked only | Single-column was simpler; user preference for two-column hasn't surfaced. |
 | §8 | `N` next-unread shortcut | Not yet | Deferred. |
 | §8 | Quote folding (`> > >` blocks collapsed) | Not yet | Deferred. |
-| §8 | Inline images | Bodies are HTML-stripped to plain text; no inline images | Privacy + scope (avoiding WebKit). |
+| §8 | Inline images | `cid:` (attachment-bundled) images: not yet wired (CSP allows them, resolver TBD). External images: opt-in per message via "Load remote images" button (Phase 5). | Privacy: external images are tracking signals; opt-in only. |
 | §10 | GRDB.swift | Raw `SQLite3` C API | Zero new deps. Schema migrations + FTS5 work fine via prepare/step/finalize. |
-| §10 | `NSAttributedString(html:)` for HTML→text | Custom `HTMLStripper` | Avoids loading WebKit per message (privacy: would auto-fetch remote `<img>`; performance: WebKit is heavy at 150k messages). |
+| §10 | `NSAttributedString(html:)` for HTML→text | Two paths: custom `HTMLStripper` for *indexing* (FTS body extraction — WebKit-per-message would tank perf at 150k); `WKWebView` for *display* (in the reader, with strict CSP that blocks all network). | Different requirements: indexing must be cheap; display must be faithful. |
 | §10 | `NSAppleScript` for compose | `mailto:` URL via `NSWorkspace` | Simpler, no Automation permission, RFC 6068 covers our needs. |
 | §11 | Sandboxed (try first, fall back) | Not sandboxed | Deferred to Phase 5. |
 | §11 | Automation permission "for the future AppleScript path" | Required *now* for Mark as Read / Unread | Phase 5 added the AppleScript path. UI shows a Settings deep-link when -1743 is seen. |
@@ -259,6 +262,7 @@ FMail/
     │   └── MessageListView.swift   Search bar + threads list / search results list
     ├── Reader/
     │   ├── ReaderView.swift        Stacked thread reader
+    │   ├── HTMLBodyView.swift      WKWebView wrapper (locked-down CSP, height auto-measure)
     │   └── ReplyConfirmationSheet.swift  Address-picker dialog
     ├── Search/
     │   ├── SearchBar.swift         With interpreted-query strip

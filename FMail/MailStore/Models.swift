@@ -48,6 +48,8 @@ struct MessageHeader: Identifiable, Hashable {
     let isRead: Bool
     let isFlagged: Bool
     let rfcMessageId: String?     // RFC 2822 Message-ID header (with angle brackets)
+    let imapUID: Int?             // Apple Mail's per-mailbox IMAP UID; lets
+                                  // AppleScript do O(1) `whose id is N` lookups
     var id: Int { rowId }
 }
 

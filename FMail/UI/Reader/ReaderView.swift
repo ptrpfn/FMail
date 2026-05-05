@@ -94,6 +94,12 @@ private struct MessageBlock: View {
     let onForward: () -> Void
     let onToggleRead: () -> Void
 
+    @State private var htmlMeasuredHeight: CGFloat = 200
+    /// Per-message opt-in: load external `<img src="http://…">` references
+    /// (e.g. newsletter graphs). False by default — privacy-preserving.
+    /// Resets when the user navigates away (MessageBlock recreated).
+    @State private var loadRemoteImages: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
@@ -114,9 +120,7 @@ private struct MessageBlock: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Text(messageBody.displayText)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    bodyContent(messageBody)
                 }
             }
         }
@@ -160,6 +164,33 @@ private struct MessageBlock: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func bodyContent(_ body: MessageBody) -> some View {
+        // Prefer HTML rendering when the message has an HTML part — much
+        // closer to Mail.app's display fidelity. WKWebView is locked down
+        // (no network) so no read-tracking pixels and no remote-image leaks.
+        if let html = body.html, !html.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                if !loadRemoteImages && HTMLBodyView.containsRemoteImages(html) {
+                    Button {
+                        loadRemoteImages = true
+                    } label: {
+                        Label("Load remote images", systemImage: "photo.on.rectangle")
+                    }
+                    .controlSize(.small)
+                    .help("This email includes external images. Loading them sends a network request to the sender's server, which can be used as a read receipt. Choice doesn't persist — re-open the email and they're hidden again.")
+                }
+                HTMLBodyView(html: html, allowRemoteImages: loadRemoteImages, measuredHeight: $htmlMeasuredHeight)
+                    .frame(height: htmlMeasuredHeight)
+                    .frame(maxWidth: .infinity)
+            }
+        } else {
+            Text(body.displayText)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
