@@ -23,7 +23,7 @@ struct HTMLBodyView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = false
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = PassThroughScrollWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")  // Transparent — pick up parent's background
         webView.allowsLinkPreview = false
@@ -110,6 +110,19 @@ struct HTMLBodyView: NSViewRepresentable {
             @unknown default:
                 decisionHandler(.cancel)
             }
+        }
+    }
+
+    /// `WKWebView` subclass that hands scroll events up to its parent.
+    /// We size the web view to fit its content (via `evaluateJavaScript`),
+    /// so its internal `NSScrollView` never has anything to scroll. Without
+    /// this override the internal scroller still eats wheel/trackpad events,
+    /// causing a brief jiggle but no visible scroll — and the user has to
+    /// move the cursor outside the WebView's bounds to scroll the message.
+    /// Forwarding the events makes the outer `ScrollView` handle them.
+    private final class PassThroughScrollWebView: WKWebView {
+        override func scrollWheel(with event: NSEvent) {
+            nextResponder?.scrollWheel(with: event)
         }
     }
 

@@ -367,6 +367,35 @@ actor IndexDB {
         }
     }
 
+    /// Unread messages whose body hasn't been indexed yet AND aren't in a
+    /// drafts/trash/junk mailbox. Used by the post-sync auto-fetch hook —
+    /// we ask Mail.app to download these so they're readable when the user
+    /// opens them. Newest first, so freshly arrived mail wins.
+    func fetchUnreadMissingBody(limit: Int) throws -> [(rowid: Int, mailboxRowId: Int, imapUID: Int?, rfcMessageId: String?)] {
+        let sql = """
+        SELECT m.apple_rowid, m.mailbox_rowid, m.imap_uid, m.rfc_message_id
+        FROM messages m
+        WHERE m.is_read = 0
+          AND m.body_indexed = 0
+          AND m.mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))
+        ORDER BY m.date_received DESC
+        LIMIT ?
+        """
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, Int64(limit))
+        var out: [(Int, Int, Int?, String?)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = Int(sqlite3_column_int64(stmt, 0))
+            let mboxId = Int(sqlite3_column_int64(stmt, 1))
+            let uid: Int? = sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 2))
+            let rfc = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
+            out.append((rowid, mboxId, uid, rfc))
+        }
+        return out.map { (rowid: $0.0, mailboxRowId: $0.1, imapUID: $0.2, rfcMessageId: $0.3) }
+    }
+
     /// Returns up to `limit` messages where body_indexed = 0, oldest-first
     /// (newer mail tends to already be parseable; older mail may need on-demand
     /// fetch from Mail.app and we want to surface gaps early).

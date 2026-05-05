@@ -45,10 +45,8 @@ struct MessageListView: View {
             )
         } else {
             VStack(spacing: 0) {
-                if model.selectedThreadIds.count > 1 {
-                    ThreadBulkActionBar(model: model)
-                    Divider()
-                }
+                ThreadListHeader(model: model)
+                Divider()
                 // Manual click handling — same reason as SearchResultsView:
                 // List(selection: Set<T>) is unreliable inside
                 // NavigationSplitView's content column, especially when
@@ -98,33 +96,49 @@ struct MessageListView: View {
     }
 }
 
-private struct ThreadBulkActionBar: View {
+/// Always-visible header above the threads list. Shows thread count, the
+/// multi-selection count when > 1, and the Mark Read / Unread buttons
+/// (greyed out when nothing is selected). Keeps the list from jumping when
+/// the user starts/stops a multi-selection.
+private struct ThreadListHeader: View {
     @Bindable var model: MailModel
 
     var body: some View {
+        let selectedCount = model.selectedThreadIds.count
+        let totalCount = model.threadsForSelectedMailbox.count
         HStack(spacing: 8) {
-            Text("\(model.selectedThreadIds.count) threads selected")
+            Text("\(totalCount) thread\(totalCount == 1 ? "" : "s")")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if selectedCount > 1 {
+                Text("·").foregroundStyle(.tertiary)
+                Text("\(selectedCount) selected")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             Button {
                 Task { await model.markSelectedThreadsAsRead(true) }
             } label: {
                 Label("Mark Read", systemImage: "envelope.open")
             }
+            .disabled(selectedCount == 0)
             Button {
                 Task { await model.markSelectedThreadsAsRead(false) }
             } label: {
                 Label("Mark Unread", systemImage: "envelope.badge")
             }
-            Button("Clear") {
-                model.selectedThreadIds = []
+            .disabled(selectedCount == 0)
+            if selectedCount > 1 {
+                Button("Clear") {
+                    model.selectedThreadIds = []
+                }
             }
         }
         .controlSize(.small)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(Color.accentColor.opacity(0.1))
+        .background(Color.secondary.opacity(0.06))
     }
 }
 
