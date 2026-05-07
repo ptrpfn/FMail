@@ -29,16 +29,58 @@ struct SearchResultsView: View {
                 // flaky, especially because opening the reader steals focus
                 // away from the List which then ignores ⌘-click.
                 // Reading `NSEvent.modifierFlags` at click time is reliable.
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.searchResults) { msg in
-                            row(for: msg)
-                            Divider()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.searchResults) { msg in
+                                row(for: msg)
+                                    .id(msg.rowId)
+                                Divider()
+                            }
+                        }
+                    }
+                    .onChange(of: model.selectedSearchResultIds) { _, newIds in
+                        guard newIds.count == 1, let id = newIds.first else { return }
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            proxy.scrollTo(id, anchor: .center)
                         }
                     }
                 }
             }
+            .focusable()
+            .onKeyPress(.upArrow) {
+                navigate(by: -1)
+                return .handled
+            }
+            .onKeyPress(.downArrow) {
+                navigate(by: 1)
+                return .handled
+            }
         }
+    }
+
+    /// Move the search-result selection by `direction` (-1 = previous,
+    /// +1 = next). Replaces any multi-selection with the single newly-
+    /// chosen row and opens it in the reader (same as a plain click).
+    private func navigate(by direction: Int) {
+        let results = model.searchResults
+        guard !results.isEmpty else { return }
+        let currentIdx: Int? = {
+            guard model.selectedSearchResultIds.count == 1,
+                  let id = model.selectedSearchResultIds.first
+            else { return nil }
+            return results.firstIndex(where: { $0.rowId == id })
+        }()
+        let newIdx: Int
+        if let currentIdx {
+            newIdx = max(0, min(results.count - 1, currentIdx + direction))
+            if newIdx == currentIdx { return }
+        } else {
+            newIdx = direction > 0 ? 0 : results.count - 1
+        }
+        let target = results[newIdx]
+        model.selectedSearchResultIds = [target.rowId]
+        model.openFromSearch(target)
     }
 
     @ViewBuilder

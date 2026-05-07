@@ -51,16 +51,53 @@ struct MessageListView: View {
                 // List(selection: Set<T>) is unreliable inside
                 // NavigationSplitView's content column, especially when
                 // opening the reader on click steals focus.
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.threadsForSelectedMailbox) { thread in
-                            threadRow(for: thread)
-                            Divider()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.threadsForSelectedMailbox) { thread in
+                                threadRow(for: thread)
+                                    .id(thread.threadId)
+                                Divider()
+                            }
+                        }
+                    }
+                    .onChange(of: model.selectedThreadId) { _, newId in
+                        guard let newId else { return }
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            proxy.scrollTo(newId, anchor: .center)
                         }
                     }
                 }
             }
+            .focusable()
+            .onKeyPress(.upArrow) {
+                navigateThreads(by: -1)
+                return .handled
+            }
+            .onKeyPress(.downArrow) {
+                navigateThreads(by: 1)
+                return .handled
+            }
         }
+    }
+
+    /// Move the open-thread selection by `direction` (-1 = previous,
+    /// +1 = next) in the visible thread list. Wraps neither end. If
+    /// nothing is selected yet, the first arrow press selects the
+    /// top (down) or the bottom (up) row.
+    private func navigateThreads(by direction: Int) {
+        let threads = model.threadsForSelectedMailbox
+        guard !threads.isEmpty else { return }
+        let currentIdx = model.selectedThreadId
+            .flatMap { id in threads.firstIndex(where: { $0.threadId == id }) }
+        let newIdx: Int
+        if let currentIdx {
+            newIdx = max(0, min(threads.count - 1, currentIdx + direction))
+            if newIdx == currentIdx { return }
+        } else {
+            newIdx = direction > 0 ? 0 : threads.count - 1
+        }
+        model.selectThread(threads[newIdx])
     }
 
     @ViewBuilder
@@ -145,6 +182,11 @@ private struct ThreadListHeader: View {
 private struct ThreadRow: View {
     let thread: ThreadSummary
 
+    private var correspondentText: String {
+        if !thread.latestSenderDisplay.isEmpty { return thread.latestSenderDisplay }
+        return thread.latestIsOutgoing ? "(no recipient)" : "(unknown sender)"
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Circle()
@@ -154,9 +196,16 @@ private struct ThreadRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
-                    Text(thread.latestSenderDisplay.isEmpty ? "(unknown sender)" : thread.latestSenderDisplay)
-                        .font(thread.unreadCount > 0 ? .body.bold() : .body)
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        if thread.latestIsOutgoing {
+                            Text("To:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(correspondentText)
+                            .font(thread.unreadCount > 0 ? .body.bold() : .body)
+                            .lineLimit(1)
+                    }
                     if thread.messageCount > 1 {
                         Text("\(thread.messageCount)")
                             .font(.caption.monospacedDigit())

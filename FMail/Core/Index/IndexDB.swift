@@ -653,16 +653,19 @@ actor IndexDB {
                 unreadCount: unread,
                 flaggedCount: flagged,
                 latestSubject: repr?.subject ?? "",
-                latestSenderDisplay: repr?.sender ?? "",
-                latestMessageRowId: repr?.rowId ?? 0
+                latestSenderDisplay: repr?.correspondent ?? "",
+                latestMessageRowId: repr?.rowId ?? 0,
+                latestIsOutgoing: repr?.isOutgoing ?? false
             ))
         }
         return out
     }
 
-    private func latestNonDraftMessageOfThread(threadId: Int) throws -> (rowId: Int, subject: String, sender: String)? {
+    private func latestNonDraftMessageOfThread(threadId: Int) throws -> RepresentativeMessage? {
         let sql = """
-        SELECT m.apple_rowid, m.subject_prefix, m.subject, COALESCE(m.sender_display, m.sender_address, '')
+        SELECT m.apple_rowid, m.subject_prefix, m.subject,
+               \(Self.outgoingFlagExpr) AS is_outgoing,
+               \(Self.correspondentExpr) AS correspondent
         FROM messages m
         WHERE m.thread_id = ?
           AND \(Self.systemMailboxExcludeFilter)
@@ -673,14 +676,7 @@ actor IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(threadId))
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            let rowid = Int(sqlite3_column_int64(stmt, 0))
-            let prefix = String(cString: sqlite3_column_text(stmt, 1))
-            let subj = String(cString: sqlite3_column_text(stmt, 2))
-            let sender = String(cString: sqlite3_column_text(stmt, 3))
-            return (rowid, prefix + subj, sender)
-        }
-        return nil
+        return try Self.decodeRepresentative(stmt)
     }
 
     /// Returns thread summaries in a mailbox, newest thread first.
@@ -732,8 +728,9 @@ actor IndexDB {
                 unreadCount: unread,
                 flaggedCount: flagged,
                 latestSubject: repr?.subject ?? "",
-                latestSenderDisplay: repr?.sender ?? "",
-                latestMessageRowId: repr?.rowId ?? 0
+                latestSenderDisplay: repr?.correspondent ?? "",
+                latestMessageRowId: repr?.rowId ?? 0,
+                latestIsOutgoing: repr?.isOutgoing ?? false
             ))
         }
         return out
@@ -830,9 +827,11 @@ actor IndexDB {
 
     // MARK: — Helpers
 
-    private func latestMessageOfThreadInMailbox(threadId: Int, mailboxRowId: Int) throws -> (rowId: Int, subject: String, sender: String)? {
+    private func latestMessageOfThreadInMailbox(threadId: Int, mailboxRowId: Int) throws -> RepresentativeMessage? {
         let sql = """
-        SELECT m.apple_rowid, m.subject_prefix, m.subject, COALESCE(m.sender_display, m.sender_address, '')
+        SELECT m.apple_rowid, m.subject_prefix, m.subject,
+               \(Self.outgoingFlagExpr) AS is_outgoing,
+               \(Self.correspondentExpr) AS correspondent
         FROM messages m
         WHERE m.thread_id = ?
           AND (m.mailbox_rowid = ?
@@ -846,14 +845,61 @@ actor IndexDB {
         bind(stmt, 1, Int64(threadId))
         bind(stmt, 2, Int64(mailboxRowId))
         bind(stmt, 3, Int64(mailboxRowId))
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            let rowid = Int(sqlite3_column_int64(stmt, 0))
-            let prefix = String(cString: sqlite3_column_text(stmt, 1))
-            let subj = String(cString: sqlite3_column_text(stmt, 2))
-            let sender = String(cString: sqlite3_column_text(stmt, 3))
-            return (rowid, prefix + subj, sender)
-        }
-        return nil
+        return try Self.decodeRepresentative(stmt)
+    }
+
+    /// Per-thread representative-message info used to populate one row in
+    /// the thread list. `correspondent` is the sender for incoming mail and
+    /// the first To-recipient for outgoing mail (sender matches one of our
+    /// account email addresses).
+    private struct RepresentativeMessage {
+        let rowId: Int
+        let subject: String
+        let correspondent: String
+        let isOutgoing: Bool
+    }
+
+    /// SQL expression: `1` when the row's sender matches one of our account
+    /// email addresses (case-insensitive), else `0`.
+    private static let outgoingFlagExpr = """
+        CASE WHEN LOWER(m.sender_address) IN (
+            SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL
+        ) THEN 1 ELSE 0 END
+        """
+
+    /// SQL expression: when the row is outgoing, the first To-recipient's
+    /// display (or address if no display); otherwise the sender's display
+    /// (or sender address if no display). Empty string fallback.
+    private static let correspondentExpr = """
+        CASE
+            WHEN LOWER(m.sender_address) IN (
+                SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL
+            )
+            THEN COALESCE(
+                (SELECT COALESCE(NULLIF(r.display, ''), r.address)
+                 FROM recipients r
+                 WHERE r.message_rowid = m.apple_rowid AND r.kind = 0
+                 ORDER BY r.position
+                 LIMIT 1),
+                ''
+            )
+            ELSE COALESCE(NULLIF(m.sender_display, ''), m.sender_address, '')
+        END
+        """
+
+    private static func decodeRepresentative(_ stmt: OpaquePointer?) throws -> RepresentativeMessage? {
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        let rowid = Int(sqlite3_column_int64(stmt, 0))
+        let prefix = String(cString: sqlite3_column_text(stmt, 1))
+        let subj = String(cString: sqlite3_column_text(stmt, 2))
+        let outgoing = sqlite3_column_int(stmt, 3) != 0
+        let correspondent = String(cString: sqlite3_column_text(stmt, 4))
+        return RepresentativeMessage(
+            rowId: rowid,
+            subject: prefix + subj,
+            correspondent: correspondent,
+            isOutgoing: outgoing
+        )
     }
 
     private func collectMessages(_ stmt: OpaquePointer?) throws -> [MessageHeader] {

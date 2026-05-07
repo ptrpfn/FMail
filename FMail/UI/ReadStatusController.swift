@@ -174,7 +174,8 @@ final class ReadStatusController {
                     flaggedCount: s.flaggedCount,
                     latestSubject: s.latestSubject,
                     latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId
+                    latestMessageRowId: s.latestMessageRowId,
+                    latestIsOutgoing: s.latestIsOutgoing
                 )
             }
         }
@@ -351,7 +352,8 @@ final class ReadStatusController {
                     flaggedCount: s.flaggedCount,
                     latestSubject: s.latestSubject,
                     latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId
+                    latestMessageRowId: s.latestMessageRowId,
+                    latestIsOutgoing: s.latestIsOutgoing
                 )
             }
         }
