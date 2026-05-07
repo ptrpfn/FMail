@@ -707,6 +707,19 @@ actor IndexDB {
     /// Returns thread summaries in a mailbox, newest thread first.
     /// Includes messages whose canonical mailbox is this one OR which are
     /// labelled into this mailbox (Gmail).
+    ///
+    /// Implementation note: aggregates are computed directly from `messages`
+    /// (no JOIN with `threads`). Joining with `threads` would silently drop
+    /// any message whose `thread_id = 0` — i.e. a message that has been
+    /// indexed but hasn't been threaded yet, which is the default state for
+    /// freshly-arrived mail in the gap between `upsertMessages` and
+    /// `replaceThreads`. Such messages would still be counted in the
+    /// sidebar's unread badge (counts read `messages` directly) and would
+    /// still match search, but their thread row would be missing from this
+    /// list — visible symptom: "list is behind, unread count is fresh".
+    /// Treating thread_id=0 as a single synthetic bucket keeps them visible
+    /// (and the rep-message picker still picks the most recent of them, so
+    /// the user sees the latest arrival).
     func loadThreadSummaries(mailboxRowId: Int, limit: Int = 500) throws -> [ThreadSummary] {
         let sql = """
         WITH mailbox_messages AS (
@@ -714,17 +727,19 @@ actor IndexDB {
             UNION
             SELECT message_rowid AS apple_rowid FROM message_labels WHERE mailbox_rowid = ?
         ),
-        thread_data AS (
-            SELECT t.thread_id,
-                   t.message_count,
-                   t.unread_count,
-                   t.flagged_count,
-                   MAX(m.date_received) AS latest,
-                   COUNT(m.apple_rowid) AS local_count
-            FROM threads t
-            JOIN messages m ON m.thread_id = t.thread_id
+        visible AS (
+            SELECT m.apple_rowid, m.thread_id, m.date_received, m.is_read, m.is_flagged
+            FROM messages m
             WHERE m.apple_rowid IN (SELECT apple_rowid FROM mailbox_messages)
-            GROUP BY t.thread_id
+        ),
+        thread_data AS (
+            SELECT thread_id,
+                   MAX(date_received) AS latest,
+                   COUNT(apple_rowid) AS local_count,
+                   SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread_count,
+                   SUM(CASE WHEN is_flagged = 1 THEN 1 ELSE 0 END) AS flagged_count
+            FROM visible
+            GROUP BY thread_id
         )
         SELECT thread_id, latest, local_count, unread_count, flagged_count
         FROM thread_data
