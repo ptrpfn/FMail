@@ -436,9 +436,14 @@ actor IndexDB {
         try stepDone(stmt)
     }
 
+    /// Returns the *effective* thread id for a message: the real thread id
+    /// when threading has run, or `apple_rowid` (the synthetic singleton id)
+    /// when it hasn't yet. Matches what the thread-list queries return, so
+    /// callers can pass the result back into `loadThreadMessages` etc. and
+    /// get a coherent result either way.
     func threadId(forMessage rowid: Int) throws -> Int? {
         var stmt: OpaquePointer?
-        try prepare("SELECT thread_id FROM messages WHERE apple_rowid = ?", into: &stmt)
+        try prepare("SELECT \(Self.effectiveThreadIdExpr) FROM messages m WHERE m.apple_rowid = ?", into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(rowid))
         if sqlite3_step(stmt) == SQLITE_ROW {
@@ -447,13 +452,15 @@ actor IndexDB {
         return nil
     }
 
-    /// One-shot rowid → thread_id map. Used by the optimistic-flip path
-    /// to update every affected thread's summary in `threadsForSelectedMailbox`,
-    /// not just the currently open one.
+    /// One-shot rowid → effective-thread-id map. Used by the optimistic-flip
+    /// path to update every affected thread's summary in
+    /// `threadsForSelectedMailbox`, not just the currently open one. Returns
+    /// the synthetic singleton id (apple_rowid) for unthreaded messages so
+    /// the keys match the ids displayed in the thread list.
     func threadIds(forMessages rowids: [Int]) throws -> [Int: Int] {
         guard !rowids.isEmpty else { return [:] }
         let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
-        let sql = "SELECT apple_rowid, thread_id FROM messages WHERE apple_rowid IN (\(placeholders))"
+        let sql = "SELECT apple_rowid, \(Self.effectiveThreadIdExpr) FROM messages m WHERE apple_rowid IN (\(placeholders))"
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
@@ -613,10 +620,22 @@ actor IndexDB {
 
     /// "All Mailboxes" view: every thread that contains at least one message
     /// outside drafts/trash/junk, newest first.
+    ///
+    /// Synthetic thread ids: a message that hasn't been threaded yet
+    /// (thread_id = 0, the schema default in the gap between `upsertMessages`
+    /// and `replaceThreads`) gets its own row keyed on its own apple_rowid
+    /// rather than collapsing every unthreaded message into one synthetic
+    /// "thread 0" bucket. Real thread ids are `min(memberRowIds)`, so a
+    /// rowid only equals a thread id when the message is in that thread —
+    /// which by definition can't happen for an unthreaded message. The
+    /// synthetic id also matches what `ThreadGrouper` will compute for the
+    /// singleton on the next sync, so the transition is seamless.
     func loadAllThreadSummaries(limit: Int = 500) throws -> [ThreadSummary] {
         let sql = """
         WITH visible AS (
-            SELECT m.apple_rowid, m.thread_id, m.date_received, m.is_read, m.is_flagged
+            SELECT m.apple_rowid,
+                   \(Self.effectiveThreadIdExpr) AS thread_id,
+                   m.date_received, m.is_read, m.is_flagged
             FROM messages m
             WHERE \(Self.systemMailboxExcludeFilter)
         ),
@@ -692,7 +711,7 @@ actor IndexDB {
         let sql = """
         SELECT \(Self.representativeSelectList)
         FROM messages m
-        WHERE m.thread_id = ?
+        WHERE \(Self.threadScopePredicate)
           AND \(Self.systemMailboxExcludeFilter)
         ORDER BY m.date_received DESC
         LIMIT 1
@@ -701,6 +720,7 @@ actor IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(threadId))
+        bind(stmt, 2, Int64(threadId))
         return try Self.decodeRepresentative(stmt)
     }
 
@@ -728,7 +748,9 @@ actor IndexDB {
             SELECT message_rowid AS apple_rowid FROM message_labels WHERE mailbox_rowid = ?
         ),
         visible AS (
-            SELECT m.apple_rowid, m.thread_id, m.date_received, m.is_read, m.is_flagged
+            SELECT m.apple_rowid,
+                   \(Self.effectiveThreadIdExpr) AS thread_id,
+                   m.date_received, m.is_read, m.is_flagged
             FROM messages m
             WHERE m.apple_rowid IN (SELECT apple_rowid FROM mailbox_messages)
         ),
@@ -808,13 +830,14 @@ actor IndexDB {
                m.sender_address, m.sender_display, m.date_sent, m.date_received,
                m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
         FROM messages m
-        WHERE m.thread_id = ?\(filter)
+        WHERE \(Self.threadScopePredicate)\(filter)
         ORDER BY m.date_received ASC
         """
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(threadId))
+        bind(stmt, 2, Int64(threadId))
         return try collectMessages(stmt)
     }
 
@@ -878,7 +901,7 @@ actor IndexDB {
         let sql = """
         SELECT \(Self.representativeSelectList)
         FROM messages m
-        WHERE m.thread_id = ?
+        WHERE \(Self.threadScopePredicate)
           AND (m.mailbox_rowid = ?
                OR m.apple_rowid IN (SELECT message_rowid FROM message_labels WHERE mailbox_rowid = ?))
         ORDER BY m.date_received DESC
@@ -888,8 +911,9 @@ actor IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(threadId))
-        bind(stmt, 2, Int64(mailboxRowId))
+        bind(stmt, 2, Int64(threadId))
         bind(stmt, 3, Int64(mailboxRowId))
+        bind(stmt, 4, Int64(mailboxRowId))
         return try Self.decodeRepresentative(stmt)
     }
 
@@ -908,6 +932,24 @@ actor IndexDB {
         /// nil for incoming. Used for dedup, not display.
         let dedupRecipient: String?
     }
+
+    /// SQL expression: the effective thread id for a row. Real thread_id
+    /// when set (>0); apple_rowid as a synthetic id when the message hasn't
+    /// been threaded yet (thread_id = 0). Real thread ids are
+    /// `min(memberRowIds)`, so a rowid never equals a real thread id unless
+    /// the message is in that thread — by definition impossible for an
+    /// unthreaded message. So the namespaces don't overlap.
+    private static let effectiveThreadIdExpr = """
+        CASE WHEN m.thread_id = 0 THEN m.apple_rowid ELSE m.thread_id END
+        """
+
+    /// SQL fragment used in the thread-scoped lookups (latest representative,
+    /// load thread messages). Matches both real-thread members and a single
+    /// synthetic-id message (an unthreaded one whose apple_rowid equals the
+    /// supplied id). Bind the same value to both `?`s.
+    private static let threadScopePredicate = """
+        (m.thread_id = ? OR (m.thread_id = 0 AND m.apple_rowid = ?))
+        """
 
     /// SQL expression: `1` when the row's sender matches one of our account
     /// email addresses (case-insensitive), else `0`.
