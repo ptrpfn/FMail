@@ -245,7 +245,7 @@ final class MailModel {
 
         searchTask = Task { [weak self] in
             do {
-                let rows = try await db.search(compiled, limit: 200)
+                let rows = try await db.search(compiled, limit: 600)
                 if Task.isCancelled { return }
                 await MainActor.run { [weak self] in
                     guard let self else { return }
@@ -511,9 +511,9 @@ final class MailModel {
             let threads: [ThreadSummary]
             switch scope {
             case .allMailboxes:
-                threads = try await db.loadAllThreadSummaries(limit: 500)
+                threads = try await db.loadAllThreadSummaries(limit: 600)
             case .mailbox(let id):
-                threads = try await db.loadThreadSummaries(mailboxRowId: id, limit: 500)
+                threads = try await db.loadThreadSummaries(mailboxRowId: id, limit: 600)
             case .none:
                 isLoadingThreads = false
                 return

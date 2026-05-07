@@ -658,7 +658,7 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         // Fetch headroom so the outgoing-dedup pass can skip rows without
         // shrinking the result below the caller's expected `limit`.
-        let fetchLimit = min(limit * 2, 1000)
+        let fetchLimit = min(limit * 2, 1500)
         bind(stmt, 1, Int64(fetchLimit))
         var out: [ThreadSummary] = []
         var seenOutgoingKeys: Set<String> = []
@@ -771,7 +771,7 @@ actor IndexDB {
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
-        let fetchLimit = min(limit * 2, 1000)
+        let fetchLimit = min(limit * 2, 1500)
         bind(stmt, 1, Int64(mailboxRowId))
         bind(stmt, 2, Int64(mailboxRowId))
         bind(stmt, 3, Int64(fetchLimit))
