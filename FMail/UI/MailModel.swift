@@ -181,6 +181,10 @@ final class MailModel {
 
             // File watcher: trigger refresh on change.
             coordinator.startFileWatcher()
+
+            // Periodic safety-net sync — catches anything FSEvents missed or
+            // the post-write skip window suppressed.
+            coordinator.startPeriodicSync()
         } catch {
             loadState = .failed(String(describing: error))
         }
@@ -317,6 +321,13 @@ final class MailModel {
             }
         case .none:
             break
+        }
+
+        // Re-run any active search so its result list reflects the new index
+        // state. Without this, `is:unread` (or any other filter) would keep
+        // showing the stale snapshot from when the user last typed.
+        if !searchQuery.isEmpty {
+            updateSearch(searchQuery)
         }
     }
 

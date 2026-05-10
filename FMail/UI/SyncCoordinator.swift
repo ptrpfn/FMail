@@ -14,6 +14,14 @@ final class SyncCoordinator {
 
     private var watcher: FileWatcher?
     private var bodyIndexerTask: Task<Void, Never>?
+    private var periodicSyncTask: Task<Void, Never>?
+    /// Belt-and-braces refresh — fires `runIncrementalSync()` even when no
+    /// FSEvents arrive (Mail.app's IMAP writes occasionally miss the watcher,
+    /// or the `skipSyncsUntil` window swallows the post-AppleScript reflow
+    /// and no later event triggers a fresh pull). 60 s is well below
+    /// Mail.app's IMAP-poll interval; full sync is idempotent so the cost
+    /// is one cheap re-mirror per minute.
+    private static let periodicSyncInterval: TimeInterval = 60
     private var syncInFlight = false
     /// Coalesces N FSEvents-during-sync down to one follow-up. By design —
     /// not a queue.
@@ -39,6 +47,18 @@ final class SyncCoordinator {
         }
         watcher.start()
         self.watcher = watcher
+    }
+
+    func startPeriodicSync() {
+        guard periodicSyncTask == nil else { return }
+        let interval = Self.periodicSyncInterval
+        periodicSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self?.runIncrementalSync()
+            }
+        }
     }
 
     func startBodyIndexer() {
