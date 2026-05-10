@@ -216,7 +216,7 @@ The `~/Library/Mail/V*/` path and Envelope Index schema are private API in spiri
 - **Compose**: **`mailto:` URL via `NSWorkspace.shared.open(_:)`** (decision: simpler than AppleScript, no Automation permission, RFC 6068 supports `subject` / `body` / `cc` / `in-reply-to` / `references`). Trade-off: Mail.app picks the From-account by heuristic. AppleScript path is a Phase 5 polish if needed.
 - **Project shape**: single Xcode app target driven by **`xcodegen`** (`project.yml` checked in; `.xcodeproj` regenerated, gitignored).
 - **Contacts**: `Contacts.framework`.
-- **Tests**: XCTest. Currently only Phase 0 smoke tests; DSL tests + parser fixtures are Phase 5 debt.
+- **Tests**: XCTest. Phase 0 smoke tests (FDA-gated) + UI pure-helper unit tests (`MailboxKind` view-scope, `Date.listFormat`, `ReplyKind.subjectPreview`, `TimeDeltaFormatter`, `MailModel` selection/sort). DSL tests + `.emlx` parser fixtures still Phase 5 debt.
 
 ## 11. Permissions, privacy, security
 
@@ -277,6 +277,7 @@ Already shipped (per IMPLEMENTATION.md):
 - Boolean `OR` / `NOT` now compose across **all** predicate types (text, date, flag, scope). Previously the Evaluator routed text predicates through one FTS5 expression and date/flag/scope predicates through a separate `AND` chain, so e.g. `(during:2025 OR during:2023)` silently became `during:2025 AND during:2023` (empty). Now compiled to one SQL boolean expression with FTS subqueries; pure-text subtrees still fuse into a single `messages_fts MATCH` for efficiency.
 - Bulk Mark Read / Unread failures now surface as a modal alert (`bulkActionError`) instead of masquerading as inline body-load errors in the reader.
 - Internal refactor: `MailModel` (1145 → 753 LOC) and `IndexDB` (1170 → 1014 LOC) split. New: `UI/ReadStatusController.swift`, `Core/Index/IndexModels.swift`, `Core/Index/IndexDB+ContactPrefs.swift`, `Core/Logging.swift` (centralised `os.Logger`). `EnvelopeReadOnly` merged into `MailStore/EnvelopeIndexReader.swift`. `MailScripter` AppleScript-builder helpers extracted (`bucketByMailbox`, `buildAccountScopedBlock`, `buildCrossAccountFallback`).
+- Second internal refactor pass: `MailModel` (760 → 675 LOC) further split. New `UI/SyncCoordinator.swift` (file watcher, body-indexer task lifecycle, sync coalescing, `skipSyncsUntil` window, `runIncrementalSync`, post-sync missing-body prefetch) and `UI/BodyFetchPoller.swift` (on-demand `.emlx` poll loop after AppleScript IMAP fetch). New `MailboxKind` enum replaces `Mailbox.kind: String`; one `MailboxKind.viewScope(forSelectedKind:allMailboxesScope:)` helper consolidates the 3× duplicated drafts/trash/junk predicate. Bulk Mark-Read writes batch through `IndexDB.setIsReadBatch` (one transaction, single throw); `countAllUnreadExcludingDrafts` failure now keeps the prior count instead of zeroing the badge; `openFromSearch` surfaces errors via `threadsError`; new `Log.db` os.Logger category for previously-silent DB paths. Shared `UI/Components/{BulkActionHeader, ListSelectionGesture}.swift` dedupe the threads-list / search-results headers and the plain/⌘/⇧ click resolver. `UI/DateFormats.swift` (`Date.listFormat()`) unifies row date formatting. `MailAppOpener.openMessage` calls now route through `MailModel.openInMailApp(_:)`.
 
 Remaining targets:
 - Saved searches, keyboard shortcuts (`J`/`K`/`N`), quote folding, Quick Look on attachments.

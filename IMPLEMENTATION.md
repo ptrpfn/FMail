@@ -2,7 +2,7 @@
 
 Companion to `FMailSpec.md`. The spec captures the design intent; this file captures **what's actually shipped**, what diverges from the spec, and what's left.
 
-Last updated: 2026-05-07.
+Last updated: 2026-05-09.
 
 ---
 
@@ -150,6 +150,13 @@ Items already shipped that the original spec put in Phase 5 (chronological-ish o
   - Sidebar selection: `selectAllMailboxes()` / `selectMailbox(_:)` collapse onto one `select(_ s: SidebarSelection)`. `SidebarView`'s `Binding(get:set:)` hand-roll became one line. Existence guard preserved (silent no-op for `.mailbox(id)` on a missing id).
   - `Core/Logging.swift` — central `Log.{sync, mailScripter, fileWatcher, bodyIndexer}` over `os.Logger`. Replaced ad-hoc `print` / `fputs` and surfaced previously-silent FSEventStream failure paths.
   - Cosmetic: dropped dead `MailModel.setReadStatus(_:isRead:)` (single), `applyOptimisticReadFlag` (singular), `MailScripter.setReadStatus` (single) + `makeScript` + `buildMailboxRef`, `MailStoreEnumerator.findFirstEmlx` / `findEmlx`, `EmlxParser.subject(of:)` + `peelLengthPrefix` + the String-overload `splitHeaderBody`. Removed `MIMEParser.splitMultipart` `cursor` vestige.
+- **Second internal refactor pass: `MailModel` decomposition + DB-error surfacing + UI-layer dedupe** (commit `ee55b53`).
+  - `MailModel` (760 → 675 LOC) split further. New `UI/SyncCoordinator.swift` (123 LOC, `@MainActor`, weak ref to MailModel) owns the file watcher, body-indexer task lifecycle, sync-coalescing flags (`syncInFlight` / `syncRequestedWhileBusy`), `skipSyncsUntil` window, `runIncrementalSync`, and the post-sync `fetchMissingUnreadBodies` prefetch. New `UI/BodyFetchPoller.swift` (30 LOC) owns the on-demand `.emlx` poll loop (the 8s retry-with-invalidate after the AppleScript `source of msg` triggers Mail.app's IMAP fetch). `ReadStatusController` now writes `model.syncCoordinator?.skipSyncsUntil` instead of reaching into MailModel.
+  - **`MailboxKind` enum** replaces `Mailbox.kind: String`. One `MailboxKind.viewScope(forSelectedKind:allMailboxesScope:)` helper plus `MailboxKind.isSystemIsolated` consolidate the three previously-duplicated `["drafts", "trash", "junk"]` predicates (in `MailModel.openFromSearch`, `MailModel.loadMessagesForSelectedThread`, `ReadStatusController.currentViewScope`). Enum's `rawValue`s match the strings already in DB so SQL filters (`kind IN ('drafts','trash','junk')`) keep working unchanged; `IndexDB.loadMailboxes` decodes via `MailboxKind(rawValue:) ?? .other`.
+  - **DB errors surfaced** instead of silent `try?`: `countAllUnreadExcludingDrafts` failure now keeps the previous count and logs (rather than zeroing the badge); `openFromSearch` distinguishes "DB error" from "no thread" and sets `threadsError` for both; bulk Mark-Read writes batch through new `IndexDB.setIsReadBatch(rowids:isRead:)` (one transaction, single throw — `setIsRead(rowid:)` now delegates to it), failures alert via `bulkActionError`; `setPreferredAddress` / `addBlockedAddress` failures log via the new `Log.db` os.Logger category instead of being silently dropped.
+  - **Shared list components** in `UI/Components/`: `BulkActionHeader.swift` collapses the duplicated "row count + selection count + Mark Read / Mark Unread / Clear" header used by both the threads list and search results. `ListSelectionGesture.swift` collapses the plain/⌘/⇧ click resolver into one `action(from: NSEvent.ModifierFlags)` returning `.open` / `.toggle` / `.rangeFromAnchor`.
+  - **Other small cleanups:** `UI/DateFormats.swift` (`Date.listFormat()`) extension unifies the threads-list and search-results row date format (was duplicated verbatim in both files). `MailAppOpener.openMessage` calls now route through `MailModel.openInMailApp(_:)` (ReaderView no longer reaches into the Compose layer). Dropped unnecessary `@Bindable` from 7 views (only `SidebarView` actually uses `$model.x`). Two compiler warnings cleared (redundant `await` on synchronous `IndexDB.init`; dead `body != nil` after `if let body = ...`). Removed unused `FocusedValues.mailModel` extension. `Task.detached { runIncrementalSync }` simplified to `Task` since `runIncrementalSync` is `@MainActor` (no detach benefit). Inner `Task { @MainActor }` removed from `BodyIndexer` progress callback (parameter was already `@MainActor`-isolated). Magic numbers extracted: `MailModel.dockBadgeMaxDisplay = 999`, `HTMLBodyView.imageReflowDelaySeconds = 1.5`. Dead `_ = acctMap`. To enable testing, `ReplyConfirmationSheet.subjectPreview` lifted onto `ReplyKind.subjectPreview(forKind:originalSubject:)` and `ReaderView.formatDelta` lifted into a free `TimeDeltaFormatter.format(_:)`.
+  - **First UI-layer tests** (`FMailTests/UILogicTests.swift`, 24 cases, no FDA needed): `MailboxKind` view-scope decision tree (4 cases) + `isSystemIsolated`; `Date.listFormat` rendering buckets (3 cases); `ReplyKind.subjectPreview` Re/Fwd cases including case-insensitive existing-prefix detection (5 cases); `TimeDeltaFormatter.format` six time buckets (6 cases); `MailModel.select` stale-id silent guard, `selectAllMailboxes`, `mailboxesByAccount` INBOX-first sort + hidden filtering (5 cases). All pass; pre-existing `Phase0Tests` still skip without FDA.
 
 Remaining (see "Open work" below).
 
@@ -216,7 +223,7 @@ Roughly in order of value-to-cost.
 - True incremental sync — currently every FSEvent triggers a full re-mirror.
 - Body indexer that picks up new mail discovered by FSEvents (currently only sweeps the initial backlog).
 - Settings pane for address overrides (review/edit `contact_prefs` rows).
-- DSL tests (snapshot for parser, property-based for boolean operators).
+- DSL tests (snapshot for parser, property-based for boolean operators). UI pure-helper tests are now in place; the DSL parser/evaluator is still untested.
 - Sandbox attempt + verify FSEventStream still fires.
 - AppleScript compose path for "send from this account" precision (currently Mail.app picks).
 - Schema-fingerprint test against live Envelope Index (catches Apple changing column names in a future macOS).
@@ -273,22 +280,35 @@ FMail/
 │   ├── MailboxFilter.swift         Hide rules ([Gmail]/All Mail, Recovered, SendLater)
 │   ├── MailboxURL.swift            Parses Apple's `imap://<uuid>/<path>` mailbox URLs
 │   ├── MailStoreEnumerator.swift   Locates ~/Library/Mail/V<N>; envelope index URL helper
-│   └── Models.swift                MailAccount, Mailbox, MessageHeader, MessageBody
+│   └── Models.swift                MailAccount, Mailbox, MessageHeader, MessageBody,
+│                                    MailboxKind enum (with viewScope helper)
 ├── Permissions/
 │   └── FullDiskAccessFlow.swift    First-run FDA prompt + System Settings deep-link
 └── UI/
     ├── AppShell.swift              Top-level shell + states (loading / FDA / indexing /
     │                                ready) + bulkActionError alert
-    ├── MailModel.swift             Main @Observable @MainActor view-model. Bulk Mark
-    │                                Read / Unread is delegated to ReadStatusController
-    │                                (lazy, ObservationIgnored).
+    ├── MailModel.swift             Main @Observable @MainActor view-model. Sync
+    │                                orchestration delegated to SyncCoordinator;
+    │                                Mark Read / Unread to ReadStatusController; the
+    │                                on-demand body retry loop to BodyFetchPoller
+    │                                (all ObservationIgnored).
+    ├── SyncCoordinator.swift       Owns file watcher + body-indexer task lifecycle +
+    │                                runIncrementalSync + sync coalescing + post-sync
+    │                                missing-body prefetch + skipSyncsUntil window.
     ├── ReadStatusController.swift  Owns Mark Read / Unread: optimistic flip across
     │                                threads/messages/search-results, AppleScript
-    │                                dispatch, sync-skip window.
+    │                                dispatch, batched DB write via setIsReadBatch.
+    ├── BodyFetchPoller.swift       8s retry-with-invalidate poll loop after the
+    │                                AppleScript `source of msg` IMAP fetch.
+    ├── DateFormats.swift           Date.listFormat() — shared row date format.
+    ├── Components/
+    │   ├── BulkActionHeader.swift  Selection-count + Mark Read/Unread/Clear header
+    │   │                            (shared by threads list and search results).
+    │   └── ListSelectionGesture.swift  Plain/⌘/⇧ click resolver.
     ├── MessageList/
     │   └── MessageListView.swift   Search bar + threads list / search results list
     ├── Reader/
-    │   ├── ReaderView.swift        Stacked thread reader
+    │   ├── ReaderView.swift        Stacked thread reader (+ TimeDeltaFormatter)
     │   ├── HTMLBodyView.swift      WKWebView wrapper (locked-down CSP, height auto-measure)
     │   └── ReplyConfirmationSheet.swift  Address-picker dialog
     ├── Search/
@@ -298,7 +318,11 @@ FMail/
         └── SidebarView.swift       Accounts → mailboxes with unread counts
 
 FMailTests/
-└── Phase0Tests.swift               Smoke tests (skip when test runner lacks FDA)
+├── Phase0Tests.swift               Smoke tests (skip when test runner lacks FDA)
+└── UILogicTests.swift              Pure-helper unit tests: MailboxKind view-scope,
+                                     Date.listFormat, ReplyKind.subjectPreview,
+                                     TimeDeltaFormatter, MailModel selection/sort
+                                     (24 cases, no FDA needed).
 
 Top-level:
 ├── FMailSpec.md                    Original design spec (intent)
