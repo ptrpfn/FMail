@@ -93,6 +93,283 @@ final class ReadStatusController {
         setReadStatus(messages: messages, isRead: isRead)
     }
 
+    // MARK: — Move actions (Delete / Move to Junk)
+
+    /// Removes messages from their current mailbox via Mail.app — UI does
+    /// the optimistic removal immediately, then the AppleScript dispatch
+    /// runs in the background. The next FSEvent-driven sync re-mirrors
+    /// Apple's Envelope Index and reconciles the move.
+    func deleteMessages(_ messages: [MessageHeader]) {
+        Task { @MainActor in
+            await applyAndDispatchMove(messages: messages, kind: .delete)
+        }
+    }
+
+    /// Like `deleteMessages` but routes to the per-account Junk mailbox.
+    func moveMessagesToJunk(_ messages: [MessageHeader]) {
+        Task { @MainActor in
+            await applyAndDispatchMove(messages: messages, kind: .junk)
+        }
+    }
+
+    /// Bulk delete from the current threads selection.
+    func deleteSelectedThreads() async {
+        await markSelectedThreads(action: .delete)
+    }
+
+    /// Bulk Move to Junk from the current threads selection.
+    func moveSelectedThreadsToJunk() async {
+        await markSelectedThreads(action: .junk)
+    }
+
+    /// Bulk delete from the current search-results selection.
+    func deleteSelectedSearchResults() {
+        let messages = model.searchResults.filter {
+            model.selectedSearchResultIds.contains($0.rowId)
+        }
+        guard !messages.isEmpty else { return }
+        deleteMessages(messages)
+    }
+
+    /// Bulk Move to Junk from the current search-results selection.
+    func moveSelectedSearchResultsToJunk() {
+        let messages = model.searchResults.filter {
+            model.selectedSearchResultIds.contains($0.rowId)
+        }
+        guard !messages.isEmpty else { return }
+        moveMessagesToJunk(messages)
+    }
+
+    /// Awaitable variant for the MCP `delete_messages` tool.
+    @MainActor
+    func deleteMessages(rowids: [Int]) async -> (applied: Int, error: String?) {
+        await runMoveByRowids(rowids: rowids, kind: .delete)
+    }
+
+    /// Awaitable variant for the MCP `move_to_junk` tool.
+    @MainActor
+    func moveToJunk(rowids: [Int]) async -> (applied: Int, error: String?) {
+        await runMoveByRowids(rowids: rowids, kind: .junk)
+    }
+
+    // MARK: — Shared move/delete pipeline
+
+    enum MoveKind {
+        case delete, junk
+
+        var verbForError: String {
+            switch self {
+            case .delete: return "Delete"
+            case .junk:   return "Move to Junk"
+            }
+        }
+    }
+
+    private func markSelectedThreads(action kind: MoveKind) async {
+        guard let db = model.indexDB else { return }
+        let viewScope = currentViewScope()
+        var allMessages: [MessageHeader] = []
+        for tid in model.selectedThreadIds {
+            if let msgs = try? await db.loadThreadMessages(threadId: tid, scope: viewScope) {
+                allMessages.append(contentsOf: msgs)
+            }
+        }
+        guard !allMessages.isEmpty else { return }
+        await applyAndDispatchMove(messages: allMessages, kind: kind)
+    }
+
+    private func runMoveByRowids(rowids: [Int], kind: MoveKind) async -> (applied: Int, error: String?) {
+        guard let db = model.indexDB else {
+            return (0, "Index not loaded")
+        }
+        var resolved: [MessageHeader] = []
+        for rowid in rowids {
+            if let m = try? await db.loadMessage(rowid: rowid) { resolved.append(m) }
+        }
+        guard !resolved.isEmpty else {
+            return (0, "No messages matched the given rowids")
+        }
+        applyOptimisticRemoval(messages: resolved)
+
+        let entries = mailScripterEntries(for: resolved)
+        guard !entries.isEmpty else {
+            return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
+        }
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        let result = await dispatchMove(entries: entries, kind: kind)
+
+        // For successful moves: Gmail (and IMAP generally) reassigns the
+        // message's apple_rowid when it changes mailboxes — the old rowid
+        // becomes invalid and a new rowid appears in the destination
+        // mailbox. FMail's index still has the OLD rowid pointing to the
+        // source mailbox until sync re-reads Apple's Envelope Index. Force
+        // an immediate sync so MCP queries (and the UI) see the new state
+        // promptly. For failures: keep the suppress window so we don't
+        // re-import data that's about to be re-tried.
+        switch result {
+        case .ok(let matched):
+            model.syncCoordinator?.skipSyncsUntil = nil
+            await model.syncCoordinator?.runIncrementalSync()
+            return (matched, nil)
+        case .notFound:
+            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            return (0, "Mail.app couldn't find any of the messages — apple_rowid may be stale.")
+        case .failed(let m):
+            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            return (resolved.count, "AppleScript failed: \(m)")
+        }
+    }
+
+    private func applyAndDispatchMove(messages: [MessageHeader], kind: MoveKind) async {
+        applyOptimisticRemoval(messages: messages)
+
+        let entries = mailScripterEntries(for: messages)
+        guard !entries.isEmpty else { return }
+
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        Task.detached { [weak model] in
+            let result = await Self.dispatchMove(entries: entries, kind: kind)
+            switch result {
+            case .ok:
+                // Force an immediate sync so the index picks up the new
+                // post-move rowids (Gmail reassigns on label changes).
+                // Otherwise the optimistic UI removal hides the messages
+                // but MCP / DB queries see stale state for ~3 minutes.
+                await MainActor.run {
+                    model?.syncCoordinator?.skipSyncsUntil = nil
+                }
+                if let sc = await MainActor.run(body: { model?.syncCoordinator }) {
+                    await sc.runIncrementalSync()
+                }
+            case .notFound:
+                await MainActor.run {
+                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                    model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
+                }
+            case .failed(let msg):
+                await MainActor.run {
+                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                    model?.bulkActionError = "\(kind.verbForError) failed: \(msg)"
+                }
+            }
+        }
+    }
+
+    private func dispatchMove(entries: [MailScripter.BatchEntry], kind: MoveKind) async -> MailScripter.Result {
+        await Self.dispatchMove(entries: entries, kind: kind)
+    }
+
+    nonisolated private static func dispatchMove(entries: [MailScripter.BatchEntry], kind: MoveKind) async -> MailScripter.Result {
+        switch kind {
+        case .delete: return await MailScripter.deleteBatch(entries)
+        case .junk:   return await MailScripter.moveToJunkBatch(entries)
+        }
+    }
+
+    /// Optimistic removal of `messages` from every visible array. Decrements
+    /// the unread/total counts on the source mailboxes and the global badge.
+    /// Threads with all members removed disappear; threads with some members
+    /// surviving have their `messageCount`/`unreadCount` reduced.
+    /// We do NOT update the DB — the next FSEvent-driven sync will re-mirror
+    /// Apple's Envelope Index and reconcile naturally.
+    private func applyOptimisticRemoval(messages: [MessageHeader]) {
+        guard !messages.isEmpty else { return }
+        let removedRowIds = Set(messages.map(\.rowId))
+
+        // Per-thread + per-mailbox tallies for count maintenance.
+        var byThread: [Int: [MessageHeader]] = [:]
+        var perMailboxTotalDelta: [Int: Int] = [:]
+        var perMailboxUnreadDelta: [Int: Int] = [:]
+        var globalUnreadDelta = 0
+
+        for m in messages {
+            perMailboxTotalDelta[m.mailboxRowId, default: 0] -= 1
+            if !m.isRead {
+                perMailboxUnreadDelta[m.mailboxRowId, default: 0] -= 1
+                globalUnreadDelta -= 1
+            }
+        }
+
+        // Resolve thread ids in the order we have them in messagesInSelectedThread
+        // (we already know thread membership from the open thread, but bulk
+        // removal may span multiple threads). Use a sync DB hop.
+        Task { @MainActor [weak model] in
+            guard let model, let db = model.indexDB else { return }
+            let map = (try? await db.threadIds(forMessages: messages.map(\.rowId))) ?? [:]
+            for m in messages {
+                if let tid = map[m.rowId] { byThread[tid, default: []].append(m) }
+            }
+
+            // 1) messagesInSelectedThread — drop removed rowids.
+            if model.messagesInSelectedThread.contains(where: { removedRowIds.contains($0.rowId) }) {
+                model.messagesInSelectedThread.removeAll { removedRowIds.contains($0.rowId) }
+            }
+
+            // 2) searchResults — drop removed rowids and prune selection.
+            if model.searchResults.contains(where: { removedRowIds.contains($0.rowId) }) {
+                model.searchResults.removeAll { removedRowIds.contains($0.rowId) }
+                model.selectedSearchResultIds = model.selectedSearchResultIds.subtracting(removedRowIds)
+            }
+
+            // 3) threadsForSelectedMailbox — decrement counts; drop empty threads.
+            var newThreads = model.threadsForSelectedMailbox
+            for (tid, group) in byThread {
+                guard let idx = newThreads.firstIndex(where: { $0.threadId == tid }) else { continue }
+                let s = newThreads[idx]
+                let unreadDrop = group.filter { !$0.isRead }.count
+                let newCount = max(0, s.messageCount - group.count)
+                if newCount == 0 {
+                    newThreads.remove(at: idx)
+                } else {
+                    newThreads[idx] = ThreadSummary(
+                        threadId: s.threadId,
+                        latestDateReceived: s.latestDateReceived,
+                        messageCount: newCount,
+                        unreadCount: max(0, s.unreadCount - unreadDrop),
+                        flaggedCount: s.flaggedCount,
+                        latestSubject: s.latestSubject,
+                        latestSenderDisplay: s.latestSenderDisplay,
+                        latestMessageRowId: s.latestMessageRowId,
+                        latestIsOutgoing: s.latestIsOutgoing
+                    )
+                }
+            }
+            model.threadsForSelectedMailbox = newThreads
+            // If the open thread is gone, clear its selection so the reader empties.
+            if let tid = model.selectedThreadId,
+               !newThreads.contains(where: { $0.threadId == tid }) {
+                model.selectedThreadId = nil
+                model.selectedThreadIds.remove(tid)
+                model.messagesInSelectedThread = []
+                model.bodyForSelectedMessage = nil
+                model.selectedMessageId = nil
+            }
+
+            // 4) Mailboxes — decrement counts on each source mailbox.
+            if !perMailboxTotalDelta.isEmpty {
+                var newMailboxes = model.mailboxes
+                for (mid, totalDelta) in perMailboxTotalDelta {
+                    let unreadDelta = perMailboxUnreadDelta[mid] ?? 0
+                    if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
+                        let mb = newMailboxes[idx]
+                        newMailboxes[idx] = Mailbox(
+                            rowId: mb.rowId, accountUUID: mb.accountUUID,
+                            pathComponents: mb.pathComponents,
+                            totalCount: max(0, mb.totalCount + totalDelta),
+                            unreadCount: max(0, mb.unreadCount + unreadDelta),
+                            hidden: mb.hidden, kind: mb.kind
+                        )
+                    }
+                }
+                model.mailboxes = newMailboxes
+            }
+
+            // 5) Global badge.
+            model.allUnreadCount = max(0, model.allUnreadCount + globalUnreadDelta)
+            model.updateDockBadge()
+        }
+    }
+
     /// Mark every message in every currently-selected thread. Honors the
     /// active scope (e.g. excludes drafts/trash/junk in All Mailboxes view)
     /// so we never accidentally flip a junk-folder message just because it

@@ -6,9 +6,24 @@ import Foundation
 struct MCPContext: Sendable {
     let indexDB: IndexDB
     let bodyLoader: BodyLoader
-    /// Optional thunk for the write tool (`mark_read`). Set in Phase A3.
-    /// Nil means no write tools are available.
+    /// Optional write thunks. Nil means the matching tool is unavailable.
     let markReadHandler: MCPMarkReadHandler?
+    let deleteHandler: MCPMoveHandler?
+    let junkHandler: MCPMoveHandler?
+
+    init(
+        indexDB: IndexDB,
+        bodyLoader: BodyLoader,
+        markReadHandler: MCPMarkReadHandler? = nil,
+        deleteHandler: MCPMoveHandler? = nil,
+        junkHandler: MCPMoveHandler? = nil
+    ) {
+        self.indexDB = indexDB
+        self.bodyLoader = bodyLoader
+        self.markReadHandler = markReadHandler
+        self.deleteHandler = deleteHandler
+        self.junkHandler = junkHandler
+    }
 }
 
 /// `@Sendable` thunk that performs `mark_read` on behalf of the MCP handler,
@@ -16,6 +31,10 @@ struct MCPContext: Sendable {
 /// MailModel.applyMCPSettings so the MCP layer doesn't need to know about
 /// MainActor / ReadStatusController directly.
 typealias MCPMarkReadHandler = @Sendable (_ rowids: [Int], _ isRead: Bool) async -> (applied: Int, error: String?)
+
+/// `@Sendable` thunk for `delete_messages` and `move_to_junk` — same shape,
+/// only the underlying AppleScript action differs.
+typealias MCPMoveHandler = @Sendable (_ rowids: [Int]) async -> (applied: Int, error: String?)
 
 /// One async function per tool. Each validates input, calls into context,
 /// and returns a JSON tree that the dispatcher will JSON-encode into the

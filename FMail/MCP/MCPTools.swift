@@ -25,6 +25,21 @@ enum MCPTools {
         await dispatcher.register(markReadTool(context: context))
     }
 
+    /// Register `delete_messages` and `move_to_junk`. Both invoke
+    /// AppleScript on Mail.app, so the same timeout caveat as `mark_read`
+    /// applies — keep batches small.
+    static func registerMoveTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
+        await dispatcher.register(deleteMessagesTool(context: context))
+        await dispatcher.register(moveToJunkTool(context: context))
+    }
+
+    /// Register `diagnose_junk_mailboxes`. Read-only, no inputs — useful
+    /// when move_to_junk doesn't take effect, to confirm what Mail.app
+    /// reports as the junk mailbox per account.
+    static func registerDiagnosticTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
+        await dispatcher.register(diagnoseJunkMailboxesTool(context: context))
+    }
+
     // MARK: — search_emails
 
     private static func searchEmailsTool(context: MCPContext) -> MCPTool {
@@ -236,6 +251,129 @@ enum MCPTools {
                 "required": .array([.string("rowids")])
             ]),
             handler: { args in try await MCPHandlers.markRead(args, context: context) }
+        )
+    }
+
+    // MARK: — delete_messages
+
+    private static func deleteMessagesTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "delete_messages",
+            description: """
+            Delete messages by rowid — Mail.app moves them to the Trash
+            mailbox of the relevant account, matching the Delete key in
+            Mail.app's UI. Reversible from Trash.
+
+            **VERIFYING THE DELETE — IMPORTANT.** Like `move_to_junk`, Gmail
+            (and most IMAP servers) reassigns the rowid when the message
+            moves to Trash. The original rowid is invalid after success.
+
+            ✗ Do NOT verify by `get_email {rowid: <original>}`.
+            ✓ DO verify by `search_emails {query: "from:<sender>
+              subject:<subj>"}` showing fewer matches in the source mailbox
+              after a 5–10s delay (FMail triggers an index sync immediately
+              after a successful delete).
+
+            Same time-bound caveat as `mark_read`: keep batches ≤ ~5 to
+            avoid client HTTP timeouts. The work may still complete on
+            Mail.app's side after a timeout — re-call is safe (no-op if
+            already deleted).
+
+            Returns `applied` (count Mail.app matched) and `error` (string
+            when AppleScript dispatch failed).
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowids": .object([
+                        "type": .string("array"),
+                        "items": .object(["type": .string("integer")]),
+                        "description": .string("Apple Mail rowids — get them from search_emails / get_thread results.")
+                    ])
+                ]),
+                "required": .array([.string("rowids")])
+            ]),
+            handler: { args in try await MCPHandlers.deleteMessages(args, context: context) }
+        )
+    }
+
+    // MARK: — move_to_junk
+
+    private static func moveToJunkTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "move_to_junk",
+            description: """
+            Move messages by rowid to the Junk (Spam) mailbox of their
+            account. For Gmail accounts this resolves to `[Gmail]/Spam`.
+
+            **VERIFYING THE MOVE — IMPORTANT.** Gmail (and most IMAP servers)
+            REASSIGNS the rowid when a message changes mailboxes. The
+            original rowid you passed in is no longer valid after a
+            successful move — a NEW rowid exists in Spam for the same
+            message (same RFC Message-ID, same subject, same sender).
+
+            ✗ Do NOT verify by `get_email {rowid: <original>}` — that rowid
+              no longer points to anything (or worse, points to stale state
+              briefly).
+            ✓ DO verify by `search_emails {query: "from:<sender>
+              subject:<subj>"}` after a 5–10s delay, or by checking
+              `search_emails` returns fewer matches in the source mailbox.
+
+            FMail triggers an immediate index sync after a successful move,
+            so the new state is usually visible within 5 seconds.
+
+            **Timing note:** Mail.app performs an IMAP MOVE for each message
+            synchronously. This takes 5–30s per message against Gmail and can
+            exceed your HTTP client's timeout for batches larger than 1–2
+            messages. **If the call times out, the move usually still
+            completes on Mail.app's side.** Wait ~30–60s and verify per the
+            note above.
+
+            For batches: keep ≤ ~5 messages per call to stay under most
+            HTTP timeouts, OR accept that the call may time out and verify
+            after.
+
+            Accounts with no junk mailbox configured (some IMAP accounts —
+            check via `diagnose_junk_mailboxes` if unsure) will get the
+            junk-status flag set locally but no actual move; `applied`
+            still reports the count.
+
+            Returns `applied` and `error` like `mark_read`.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowids": .object([
+                        "type": .string("array"),
+                        "items": .object(["type": .string("integer")]),
+                        "description": .string("Apple Mail rowids — get them from search_emails / get_thread results.")
+                    ])
+                ]),
+                "required": .array([.string("rowids")])
+            ]),
+            handler: { args in try await MCPHandlers.moveToJunk(args, context: context) }
+        )
+    }
+
+    // MARK: — diagnose_junk_mailboxes
+
+    private static func diagnoseJunkMailboxesTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "diagnose_junk_mailboxes",
+            description: """
+            Asks Mail.app directly what each configured account's
+            `junk mailbox` is, and lists every mailbox name in each account
+            that looks like Spam/Junk. Use this when `move_to_junk` doesn't
+            actually move the message — the output tells us whether the
+            target mailbox resolution is the problem.
+
+            Returns `{ "output": "<plain-text dump>" }`. No side effects.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([:])
+            ]),
+            handler: { args in try await MCPHandlers.diagnoseJunkMailboxes(args, context: context) }
         )
     }
 

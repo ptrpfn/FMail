@@ -144,6 +144,8 @@ private struct ThreadListHeader: View {
             selectedCount: model.selectedThreadIds.count,
             onMarkRead: { Task { await model.markSelectedThreadsAsRead(true) } },
             onMarkUnread: { Task { await model.markSelectedThreadsAsRead(false) } },
+            onMoveToJunk: { Task { await model.moveSelectedThreadsToJunk() } },
+            onDelete: { Task { await model.deleteSelectedThreads() } },
             onClearSelection: { model.selectedThreadIds = [] }
         )
     }

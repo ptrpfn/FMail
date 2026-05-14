@@ -24,17 +24,15 @@ struct FMailApp: App {
                     Task {
                         let dump = await MailScripter.diagnoseStructure()
                         await MainActor.run {
-                            let alert = NSAlert()
-                            alert.messageText = "Mail.app accounts & mailboxes"
-                            alert.informativeText = dump.isEmpty ? "(no output)" : dump
-                            alert.addButton(withTitle: "Copy")
-                            alert.addButton(withTitle: "Close")
-                            let response = alert.runModal()
-                            if response == .alertFirstButtonReturn {
-                                let pb = NSPasteboard.general
-                                pb.clearContents()
-                                pb.setString(dump, forType: .string)
-                            }
+                            showDiagnosticAlert(title: "Mail.app accounts & mailboxes", body: dump)
+                        }
+                    }
+                }
+                Button("Diagnose Junk mailboxes…") {
+                    Task {
+                        let dump = await MailScripter.diagnoseJunkMailboxes()
+                        await MainActor.run {
+                            showDiagnosticAlert(title: "Junk mailbox per account", body: dump)
                         }
                     }
                 }
@@ -44,5 +42,20 @@ struct FMailApp: App {
         Settings {
             SettingsView(model: model)
         }
+    }
+}
+
+@MainActor
+private func showDiagnosticAlert(title: String, body: String) {
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = body.isEmpty ? "(no output)" : body
+    alert.addButton(withTitle: "Copy")
+    alert.addButton(withTitle: "Close")
+    let response = alert.runModal()
+    if response == .alertFirstButtonReturn {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(body, forType: .string)
     }
 }

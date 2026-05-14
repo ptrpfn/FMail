@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Always-visible header with row count, selection count, Mark Read/Unread,
-/// and Clear. Shared by the threads list and search results — both have the
-/// same shape, only the data behind it differs.
+/// Move to Junk, Delete, and Clear. Shared by the threads list and search
+/// results — both have the same shape, only the data behind it differs.
 struct BulkActionHeader: View {
     let totalCount: Int
     /// Singular/plural label for `totalCount` — e.g. `{ "\($0) threads" }`.
@@ -10,6 +10,8 @@ struct BulkActionHeader: View {
     let selectedCount: Int
     let onMarkRead: () -> Void
     let onMarkUnread: () -> Void
+    let onMoveToJunk: () -> Void
+    let onDelete: () -> Void
     let onClearSelection: () -> Void
 
     var body: some View {
@@ -30,6 +32,14 @@ struct BulkActionHeader: View {
             .disabled(selectedCount == 0)
             Button(action: onMarkUnread) {
                 Label("Mark Unread", systemImage: "envelope.badge")
+            }
+            .disabled(selectedCount == 0)
+            Button(action: onMoveToJunk) {
+                Label("Junk", systemImage: "exclamationmark.octagon")
+            }
+            .disabled(selectedCount == 0)
+            Button(role: .destructive, action: onDelete) {
+                Label("Delete", systemImage: "trash")
             }
             .disabled(selectedCount == 0)
             if selectedCount > 1 {

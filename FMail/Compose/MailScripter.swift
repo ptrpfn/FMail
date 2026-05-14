@@ -83,30 +83,125 @@ enum MailScripter {
     /// of 100. Falls through to the broad-walk path for entries that
     /// don't have account/mailbox info.
     static func setReadStatusBatch(_ entries: [BatchEntry], isRead: Bool) async -> Result {
-        guard !entries.isEmpty else { return .notFound }
-        let bucketed = bucketByMailbox(entries)
-        let action = "set read status of msg to \(isRead ? "true" : "false")"
+        let v = isRead ? "true" : "false"
+        return await runActionBatch(
+            entries: entries,
+            accountScopedAction: "set read status of msg to \(v)",
+            crossAccountAction: "set read status of msg to \(v)"
+        )
+    }
 
-        var blocks: [String] = bucketed.groups.values.map { group in
-            buildAccountScopedBlock(group: group, action: action, withFallbackWalk: true)
-        }
-        if let fallback = buildCrossAccountFallback(
-            uids: bucketed.fallbackUIDs,
-            rfcIds: bucketed.fallbackRfcIds,
-            action: action
-        ) {
-            blocks.append(fallback)
-        }
+    /// Delete a batch of messages — Mail.app's `delete msg` moves them to
+    /// the Trash mailbox of the relevant account (matches the Delete key
+    /// behaviour in Mail.app's UI). Same per-mailbox bucketing pattern as
+    /// `setReadStatusBatch`.
+    static func deleteBatch(_ entries: [BatchEntry]) async -> Result {
+        await runActionBatch(
+            entries: entries,
+            accountScopedAction: "delete msg",
+            crossAccountAction: "delete msg"
+        )
+    }
 
-        let source = """
-        with timeout of 600 seconds
-            tell application "Mail"
-                set foundCount to 0
-                \(blocks.joined(separator: "\n"))
-                return foundCount
-            end tell
-        end timeout
+    /// Move a batch of messages to the Junk (Spam) mailbox of their
+    /// account. Three-step action so it's resilient to Mail.app accounts
+    /// where `junk mailbox of <account>` returns `missing value` (observed
+    /// for some Gmail setups — symptom is move-to-junk silently no-ops):
+    ///   1. `set junk mail status of msg to true` — fast, local, always
+    ///      works, also trains Gmail's spam filter.
+    ///   2. Try `junk mailbox of <account>`; if missing, walk
+    ///      `mailboxes of <account>` looking for a name match against
+    ///      "Spam" / "Junk" / common Gmail variants.
+    ///   3. `set mailbox of msg to tgtMbox` — the actual move.
+    /// The action references the account variable in scope, which differs
+    /// between the account-scoped block (`theAccount`) and the cross-account
+    /// fallback (`anAccount`).
+    static func moveToJunkBatch(_ entries: [BatchEntry]) async -> Result {
+        await runActionBatch(
+            entries: entries,
+            accountScopedAction: moveToJunkAction(accountVar: "theAccount"),
+            crossAccountAction: moveToJunkAction(accountVar: "anAccount")
+        )
+    }
+
+    /// The multi-line "move to junk" AppleScript action, parameterized on
+    /// which AppleScript variable holds the account reference at the call
+    /// site. Internal for testability — see `MailScripterTests`.
+    ///
+    /// Decisions, in the order we learned them the hard way:
+    ///   1. `set junk mail status` is wrapped in `try` so a failure there
+    ///      (e.g. a read-only Gmail label view) doesn't bubble out of the
+    ///      outer `repeat with msg in matches` and skip the foundCount
+    ///      increment.
+    ///   2. Name walk runs FIRST; `junk mailbox of <account>` only as last
+    ///      resort. The `junk mailbox` property is unreliable: verified via
+    ///      `diagnose_junk_mailboxes` that it errors for every account in
+    ///      some Mail.app configurations (macOS Tahoe).
+    ///   3. **No `ignoring application responses`**. We tried wrapping the
+    ///      move to make the script return fast — turned out Mail.app's
+    ///      AppleEvent queue drops the move when osascript terminates
+    ///      before it processes the event, so the script reported `applied:N`
+    ///      but messages stayed in their source mailbox. Trade-off: the MCP
+    ///      call now blocks until Mail.app finishes the IMAP MOVE (5–30s per
+    ///      message, more for big batches), and may exceed the LLM client's
+    ///      HTTP timeout — but the move actually completes on Mail.app's
+    ///      side. The tool description tells the LLM to expect this and
+    ///      verify via `search_emails` after a delay.
+    ///   4. `move msg to tgtMbox` instead of `set mailbox of msg to tgtMbox`.
+    ///      Both are documented as equivalent but `move` is the canonical
+    ///      verb for cross-mailbox moves and appears to be more reliable
+    ///      for Gmail's label-based store.
+    static func moveToJunkAction(accountVar: String) -> String {
         """
+        try
+            set junk mail status of msg to true
+        end try
+        set tgtMbox to missing value
+        try
+            repeat with cMbox in (mailboxes of \(accountVar))
+                try
+                    set cName to name of cMbox
+                    if cName is "Spam" or cName is "Junk" or cName is "Spam mail" or cName is "Bulk Mail" or cName is "[Gmail]/Spam" then
+                        set tgtMbox to cMbox
+                        exit repeat
+                    end if
+                end try
+            end repeat
+        end try
+        if tgtMbox is missing value then
+            try
+                set tgtMbox to junk mailbox of \(accountVar)
+            end try
+        end if
+        if tgtMbox is not missing value then
+            try
+                move msg to tgtMbox
+            end try
+        end if
+        """
+    }
+
+    // MARK: — Shared scaffold
+
+    /// Common AppleScript runner for any per-message action that follows
+    /// the bucket-by-mailbox pattern. The two action strings cover the two
+    /// in-scope account-variable contexts:
+    ///   - `accountScopedAction` runs inside `buildAccountScopedBlock`,
+    ///     where `theAccount` is bound.
+    ///   - `crossAccountAction` runs inside `buildCrossAccountFallback`,
+    ///     where `anAccount` is the loop variable.
+    /// Most actions don't reference the account at all (mark-read, delete);
+    /// pass the same string for both. Junk needs different strings.
+    private static func runActionBatch(
+        entries: [BatchEntry],
+        accountScopedAction: String,
+        crossAccountAction: String
+    ) async -> Result {
+        guard let source = buildScriptSource(
+            entries: entries,
+            accountScopedAction: accountScopedAction,
+            crossAccountAction: crossAccountAction
+        ) else { return .notFound }
 
         let (stdout, stderr, exitCode) = await runOsascript(source)
         if exitCode != 0 {
@@ -116,6 +211,41 @@ enum MailScripter {
         }
         let count = Int(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         return count > 0 ? .ok(matched: count) : .notFound
+    }
+
+    /// Builds the full osascript source for one batch. Internal so tests
+    /// can verify the emitted script contains the expected commands and
+    /// fallback logic. Returns nil when there's nothing to do (`entries`
+    /// empty, or none had enough info to be addressable).
+    static func buildScriptSource(
+        entries: [BatchEntry],
+        accountScopedAction: String,
+        crossAccountAction: String
+    ) -> String? {
+        guard !entries.isEmpty else { return nil }
+        let bucketed = bucketByMailbox(entries)
+
+        var blocks: [String] = bucketed.groups.values.map { group in
+            buildAccountScopedBlock(group: group, action: accountScopedAction, withFallbackWalk: true)
+        }
+        if let fallback = buildCrossAccountFallback(
+            uids: bucketed.fallbackUIDs,
+            rfcIds: bucketed.fallbackRfcIds,
+            action: crossAccountAction
+        ) {
+            blocks.append(fallback)
+        }
+        guard !blocks.isEmpty else { return nil }
+
+        return """
+        with timeout of 600 seconds
+            tell application "Mail"
+                set foundCount to 0
+                \(blocks.joined(separator: "\n"))
+                return foundCount
+            end tell
+        end timeout
+        """
     }
 
     // MARK: — Bucketing
@@ -389,6 +519,13 @@ enum MailScripter {
         let uidChunks = uids.chunked(into: chunkSize)
         let rfcChunks = rfcIds.chunked(into: chunkSize)
 
+        // Multi-line actions (e.g. the junk script: set status + lookup +
+        // move) need every line indented to the same level as the surrounding
+        // `repeat with msg in matches` body, not just the first.
+        let actionLines = action
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
         var lines: [String] = []
         let hasUIDs = !uids.isEmpty
         let hasRfcIds = !rfcIds.isEmpty
@@ -401,7 +538,9 @@ enum MailScripter {
                 lines.append("try")
                 lines.append("    set matches to (messages of \(mailboxRef) whose \(condition))")
                 lines.append("    repeat with msg in matches")
-                lines.append("        \(action)")
+                for actLine in actionLines {
+                    lines.append("        \(actLine)")
+                }
                 lines.append("        set foundCount to foundCount + 1")
                 lines.append("    end repeat")
                 lines.append("end try")
@@ -421,7 +560,9 @@ enum MailScripter {
                 lines.append("\(bodyIndent)try")
                 lines.append("\(bodyIndent)    set matches to (messages of \(mailboxRef) whose \(condition))")
                 lines.append("\(bodyIndent)    repeat with msg in matches")
-                lines.append("\(bodyIndent)        \(action)")
+                for actLine in actionLines {
+                    lines.append("\(bodyIndent)        \(actLine)")
+                }
                 lines.append("\(bodyIndent)        set foundCount to foundCount + 1")
                 lines.append("\(bodyIndent)    end repeat")
                 lines.append("\(bodyIndent)end try")
@@ -474,6 +615,67 @@ enum MailScripter {
     }
 
     // MARK: — Diagnostics
+
+    /// For each Mail.app account, report: account name; what
+    /// `junk mailbox of acc` resolves to (or "missing value"); the names of
+    /// all mailboxes whose name suggests Spam/Junk. Useful when Move to
+    /// Junk silently fails — tells us whether the bug is in our script
+    /// (`junk mailbox` returned something we didn't expect) or in Mail.app
+    /// (no junk mailbox configured at all). No write side effects.
+    static func diagnoseJunkMailboxes() async -> String {
+        let source = """
+        with timeout of 60 seconds
+            tell application "Mail"
+                set output to ""
+                repeat with acc in accounts
+                    try
+                        set output to output & "Account: " & (name of acc) & return
+                    end try
+                    try
+                        set output to output & "  emails: " & ((email addresses of acc) as string) & return
+                    end try
+                    set junkName to "(missing value)"
+                    try
+                        set junkName to name of (junk mailbox of acc)
+                    on error errMsg
+                        set junkName to "(error: " & errMsg & ")"
+                    end try
+                    set output to output & "  junk mailbox of acc → " & junkName & return
+                    try
+                        repeat with m in (mailboxes of acc)
+                            try
+                                set nm to name of m
+                                if (nm is "Spam") or (nm is "Junk") or (nm is "Spam mail") or (nm is "Bulk Mail") or nm contains "Spam" or nm contains "Junk" then
+                                    set output to output & "  candidate mailbox: " & nm & return
+                                end if
+                            end try
+                        end repeat
+                    end try
+                    try
+                        repeat with m1 in (mailboxes of acc)
+                            try
+                                repeat with m2 in (mailboxes of m1)
+                                    try
+                                        set nm2 to name of m2
+                                        if (nm2 is "Spam") or (nm2 is "Junk") or nm2 contains "Spam" or nm2 contains "Junk" then
+                                            set output to output & "  nested candidate: " & (name of m1) & "/" & nm2 & return
+                                        end if
+                                    end try
+                                end repeat
+                            end try
+                        end repeat
+                    end try
+                end repeat
+                return output
+            end tell
+        end timeout
+        """
+        let (stdout, stderr, exitCode) = await runOsascript(source)
+        if exitCode != 0 {
+            return "Diagnostic failed (exit \(exitCode)): \(stderr.isEmpty ? stdout : stderr)"
+        }
+        return stdout
+    }
 
     /// Returns a human-readable dump of Mail.app's account / mailbox
     /// hierarchy (top-level + one nested level). Useful when "Mark as

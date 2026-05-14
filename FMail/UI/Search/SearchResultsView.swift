@@ -137,6 +137,8 @@ private struct SearchResultsHeader: View {
             selectedCount: model.selectedSearchResultIds.count,
             onMarkRead: { model.markSelectedSearchResultsAsRead(true) },
             onMarkUnread: { model.markSelectedSearchResultsAsRead(false) },
+            onMoveToJunk: { model.moveSelectedSearchResultsToJunk() },
+            onDelete: { model.deleteSelectedSearchResults() },
             onClearSelection: { model.selectedSearchResultIds = [] }
         )
     }

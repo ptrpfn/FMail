@@ -241,17 +241,27 @@ final class MailModel {
             mcpServer = server
         }
         mcpServerStatus = .starting
-        // Build the write thunk so the MCP `mark_read` handler can dispatch
-        // through ReadStatusController without reaching across the actor
-        // boundary itself.
+        // Write thunks — each routes through ReadStatusController on
+        // MainActor so the MCP layer doesn't reach across actor boundaries
+        // itself.
         let markReadHandler: MCPMarkReadHandler = { [weak self] rowids, isRead in
             guard let self else { return (0, "MailModel deallocated") }
             return await self.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
         }
+        let deleteHandler: MCPMoveHandler = { [weak self] rowids in
+            guard let self else { return (0, "MailModel deallocated") }
+            return await self.readStatus.deleteMessages(rowids: rowids)
+        }
+        let junkHandler: MCPMoveHandler = { [weak self] rowids in
+            guard let self else { return (0, "MailModel deallocated") }
+            return await self.readStatus.moveToJunk(rowids: rowids)
+        }
         let context = MCPContext(
             indexDB: indexDB,
             bodyLoader: bodyLoader,
-            markReadHandler: markReadHandler
+            markReadHandler: markReadHandler,
+            deleteHandler: deleteHandler,
+            junkHandler: junkHandler
         )
         Task { @MainActor [weak self] in
             // If a previous run is still listening on a different port, stop first.
@@ -262,6 +272,8 @@ final class MailModel {
                 let dispatcher = await server.dispatcherForRegistration()
                 await MCPTools.registerReadTools(on: dispatcher, context: context)
                 await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
+                await MCPTools.registerMoveTools(on: dispatcher, context: context)
+                await MCPTools.registerDiagnosticTools(on: dispatcher, context: context)
                 try await server.start(port: desiredPort)
                 let p = await server.port
                 self?.mcpServerStatus = .running(port: p)
@@ -495,6 +507,26 @@ final class MailModel {
     /// Bulk-mark from the threads selection. Forwards to ReadStatusController.
     func markSelectedThreadsAsRead(_ isRead: Bool) async {
         await readStatus.markSelectedThreads(asRead: isRead)
+    }
+
+    /// Bulk Delete (move to Trash) from the threads selection.
+    func deleteSelectedThreads() async {
+        await readStatus.deleteSelectedThreads()
+    }
+
+    /// Bulk Move to Junk from the threads selection.
+    func moveSelectedThreadsToJunk() async {
+        await readStatus.moveSelectedThreadsToJunk()
+    }
+
+    /// Bulk Delete (move to Trash) from the search-results selection.
+    func deleteSelectedSearchResults() {
+        readStatus.deleteSelectedSearchResults()
+    }
+
+    /// Bulk Move to Junk from the search-results selection.
+    func moveSelectedSearchResultsToJunk() {
+        readStatus.moveSelectedSearchResultsToJunk()
     }
 
     func selectMessage(_ message: MessageHeader) {

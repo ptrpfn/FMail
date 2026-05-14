@@ -300,7 +300,7 @@ Remaining targets:
 
 Only if v1 proves itself for 6+ months:
 
-- Direct Gmail API client for the main Gmail account (sync independence from Mail.app).
+- Direct Gmail API client for the main Gmail account (sync independence from Mail.app). **Concrete proposal: [WRITEBACK_PLAN.md](WRITEBACK_PLAN.md)** — promoted from v2 candidate to active plan after macOS Tahoe broke Mail.app's AppleScript handler for move/junk operations. Initially scoped to writebacks (move/junk/delete), not full read-side independence.
 - IMAP IDLE for iCloud (same reason).
 - iOS companion viewer — see §14 for the strategy.
 
@@ -386,7 +386,7 @@ If Mac v1 isn't hitting daily-use bar, do not start the iOS phases.
 
 When FMail is running, an opt-in HTTP/JSON-RPC server on `127.0.0.1:8765` exposes the index to MCP clients (Claude Code, etc.). The point is to leverage what FMail already builds — schema-versioned SQLite, FTS5, the DSL, threading, contact prefs — so an LLM can triage email without parsing `.emlx` itself or pulling the whole index into context. See [MCP_PLAN.md](MCP_PLAN.md) for the full design.
 
-Six tools, one write: `search_emails`, `list_threads`, `get_thread`, `get_email`, `find_unanswered_threads`, `mark_read`. The `search_emails` description embeds the full DSL grammar from §6.2 so the LLM can compose queries without external knowledge. `mark_read` routes through `ReadStatusController` so the optimistic flip + AppleScript dispatch matches what the UI does — failures still surface as a `bulkActionError` alert in FMail.
+Eight tools, three writes: `search_emails`, `list_threads`, `get_thread`, `get_email`, `find_unanswered_threads`, `mark_read`, `delete_messages`, `move_to_junk`. The `search_emails` description embeds the full DSL grammar from §6.2 so the LLM can compose queries without external knowledge. The write tools route through `ReadStatusController` so the optimistic flip + AppleScript dispatch matches what the UI does — failures still surface as a `bulkActionError` alert in FMail. Delete and Move to Junk shipped as a follow-up after the core six (originally deferred — see MCP_PLAN.md), wiring up to the same `BulkActionHeader` buttons the UI exposes.
 
 Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. `mark_read` synchronously waits for Mail.app's AppleScript dispatch — the tool description tells the LLM to keep batches ≤ ~50 to avoid client timeouts; SSE/streaming progress is deferred until usage demands it.
 
