@@ -97,11 +97,24 @@ struct WritebackRouter: Sendable {
             prefs = [:]  // fall back to defaults
         }
 
-        // 3. Group by service kind.
+        // 3. Group by service kind. Enrich each ref with its account's
+        //    Keychain label so the Gmail/IMAP services don't need their
+        //    own IndexDB hop to find credentials.
         var byService: [WritebackKind: [MessageRef]] = [:]
         for ref in refs {
-            let kind = prefs[ref.accountID]?.service ?? .applescript
-            byService[kind, default: []].append(ref)
+            let pref = prefs[ref.accountID]
+            let kind = pref?.service ?? .applescript
+            let enriched = MessageRef(
+                accountID: ref.accountID,
+                accountEmail: ref.accountEmail,
+                appleRowId: ref.appleRowId,
+                imapUID: ref.imapUID,
+                imapFolderPath: ref.imapFolderPath,
+                rfcMessageId: ref.rfcMessageId,
+                gmailMessageId: ref.gmailMessageId,
+                keychainLabel: pref?.keychainLabel
+            )
+            byService[kind, default: []].append(enriched)
         }
 
         // 4. Dispatch each group; merge.

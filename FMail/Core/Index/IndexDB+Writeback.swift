@@ -145,7 +145,8 @@ extension IndexDB {
                 imapUID: uid,
                 imapFolderPath: pathComponents,
                 rfcMessageId: rfcId,
-                gmailMessageId: nil  // Phase B1 populates from Gmail API
+                gmailMessageId: nil,  // Phase B1 populates from Gmail API
+                keychainLabel: nil    // router enriches from account_writeback prefs
             )
         }
         return out

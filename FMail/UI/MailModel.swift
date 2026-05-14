@@ -790,6 +790,55 @@ final class MailModel {
         return MailAppOpener.openMessage(rfcMessageId: rfcId)
     }
 
+    // MARK: — Gmail OAuth (Phase B1)
+
+    /// Account email addresses that look like Gmail (`*.gmail.com` /
+    /// `*.googlemail.com`). Workspace custom-domain Gmail accounts aren't
+    /// detected automatically — those would need a manual "treat this as
+    /// Gmail" toggle in Settings (B3 polish).
+    var gmailDetectedAccounts: [MailAccount] {
+        accounts.filter { acc in
+            guard let email = acc.emailAddress?.lowercased() else { return false }
+            return email.hasSuffix("@gmail.com") || email.hasSuffix("@googlemail.com")
+        }
+    }
+
+    /// Drive the OAuth flow for `email`, persist credentials, and mark
+    /// the account as `.gmailApi` in `account_writeback`. After this
+    /// returns successfully, the writeback router will route moves/deletes
+    /// for this account through `GmailAPIWritebackService`.
+    func authorizeGmailAccount(email: String) async throws {
+        let label = try await GmailAuthManager.shared.authorize(email: email)
+        guard let acct = accounts.first(where: {
+            ($0.emailAddress ?? "").lowercased() == email.lowercased()
+        }), let db = indexDB else {
+            throw OAuthFlowError.malformedCallback("no FMail account matches \(email)")
+        }
+        try await db.setWritebackPreference(
+            accountUUID: acct.uuid,
+            service: .gmailApi,
+            keychainLabel: label
+        )
+    }
+
+    /// Remove the Keychain entry and revert the account to AppleScript
+    /// writeback. Doesn't revoke server-side — for that the user visits
+    /// myaccount.google.com → Security → Third-party access.
+    func revokeGmailAccount(email: String) async throws {
+        let label = GmailAuthManager.keychainLabel(for: email)
+        try await GmailAuthManager.shared.revoke(label: label)
+        guard let acct = accounts.first(where: {
+            ($0.emailAddress ?? "").lowercased() == email.lowercased()
+        }), let db = indexDB else { return }
+        try await db.clearWritebackPreference(accountUUID: acct.uuid)
+    }
+
+    /// True when `email` has stored Gmail OAuth credentials. Used by
+    /// SettingsView to pick "Authorize…" vs "Revoke".
+    func isGmailAuthorized(email: String) async -> Bool {
+        await GmailAuthManager.shared.isAuthorized(email: email)
+    }
+
 }
 
 enum SidebarSelection: Hashable, Sendable {

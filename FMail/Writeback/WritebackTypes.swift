@@ -43,6 +43,7 @@ struct MessageRef: Sendable, Hashable {
     let imapFolderPath: [String]?   // ["[Gmail]", "All Mail"] etc.
     let rfcMessageId: String?       // fallback identifier
     let gmailMessageId: String?     // Gmail API's stable per-account ID
+    let keychainLabel: String?      // Gmail API + IMAP credential pointer
 }
 
 /// Aggregate result of a writeback call. `applied` is the count of messages

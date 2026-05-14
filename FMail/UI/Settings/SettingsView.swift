@@ -13,9 +13,34 @@ struct SettingsView: View {
     @AppStorage(MCPSettings.portKey) private var port: Int = MCPSettings.defaultPort
 
     @State private var copied = false
+    @State private var gmailAuthStatus: [String: GmailAuthRowStatus] = [:]
+    @State private var gmailLastError: [String: String] = [:]
 
     var body: some View {
         Form {
+            // MARK: — Server-direct writeback (Phase B1)
+            Section {
+                if !GmailOAuthConfig.isConfigured {
+                    Text("Gmail OAuth client ID isn't configured. See README — \"Gmail OAuth setup\".")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else if model.gmailDetectedAccounts.isEmpty {
+                    Text("No Gmail accounts detected in Mail.app.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.gmailDetectedAccounts, id: \.uuid) { acct in
+                        gmailAccountRow(account: acct)
+                    }
+                }
+            } header: {
+                Text("Gmail accounts")
+            } footer: {
+                Text("Authorized accounts use the Gmail API directly for move / junk / delete — bypassing Mail.app's flaky AppleScript bridge. AppleScript stays as a fallback for unauthorized accounts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section {
                 Toggle("Enable MCP server", isOn: $enabled)
                     .onChange(of: enabled) { _, _ in model.applyMCPSettings() }
@@ -77,6 +102,101 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding()
         .frame(minWidth: 460, minHeight: 460)
+        .task { await refreshAllGmailAuthStatus() }
+    }
+
+    // MARK: — Gmail per-account row
+
+    @ViewBuilder
+    private func gmailAccountRow(account: MailAccount) -> some View {
+        let email = account.emailAddress ?? "(no email)"
+        let status = gmailAuthStatus[email] ?? .unknown
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(email)
+                    .font(.callout)
+                if let err = gmailLastError[email] {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+            }
+            Spacer()
+            statusBadge(for: status)
+            actionButton(for: account, email: email, status: status)
+        }
+    }
+
+    @ViewBuilder
+    private func statusBadge(for status: GmailAuthRowStatus) -> some View {
+        switch status {
+        case .unknown:
+            ProgressView().controlSize(.small)
+        case .notAuthorized:
+            HStack(spacing: 4) {
+                Circle().fill(.gray).frame(width: 8, height: 8)
+                Text("Not authorized").font(.caption).foregroundStyle(.secondary)
+            }
+        case .authorized:
+            HStack(spacing: 4) {
+                Circle().fill(.green).frame(width: 8, height: 8)
+                Text("Authorized").font(.caption).foregroundStyle(.secondary)
+            }
+        case .authorizing:
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.small)
+                Text("Authorizing…").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(for account: MailAccount, email: String, status: GmailAuthRowStatus) -> some View {
+        switch status {
+        case .unknown, .authorizing:
+            EmptyView()
+        case .notAuthorized:
+            Button("Authorize…") {
+                Task { await authorize(email: email) }
+            }
+            .controlSize(.small)
+        case .authorized:
+            Button("Revoke") {
+                Task { await revoke(email: email) }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private func authorize(email: String) async {
+        gmailAuthStatus[email] = .authorizing
+        gmailLastError[email] = nil
+        do {
+            try await model.authorizeGmailAccount(email: email)
+            gmailAuthStatus[email] = .authorized
+        } catch {
+            gmailAuthStatus[email] = .notAuthorized
+            gmailLastError[email] = String(describing: error)
+        }
+    }
+
+    private func revoke(email: String) async {
+        do {
+            try await model.revokeGmailAccount(email: email)
+            gmailAuthStatus[email] = .notAuthorized
+            gmailLastError[email] = nil
+        } catch {
+            gmailLastError[email] = String(describing: error)
+        }
+    }
+
+    private func refreshAllGmailAuthStatus() async {
+        for acct in model.gmailDetectedAccounts {
+            guard let email = acct.emailAddress else { continue }
+            let isAuthorized = await model.isGmailAuthorized(email: email)
+            gmailAuthStatus[email] = isAuthorized ? .authorized : .notAuthorized
+        }
     }
 
     @ViewBuilder
@@ -103,6 +223,16 @@ struct SettingsView: View {
                 Text("Error")
             }
         }
+    }
+
+    /// Per-row UI state for the Gmail account list. Computed asynchronously
+    /// on view appear; transitions to `.authorizing` while the OAuth flow
+    /// runs in the user's browser.
+    private enum GmailAuthRowStatus: Sendable, Equatable {
+        case unknown        // not yet checked
+        case notAuthorized  // no Keychain entry
+        case authorizing    // OAuth flow in progress
+        case authorized     // has stored credentials
     }
 
     private func copyClaudeCodeConfig() {
