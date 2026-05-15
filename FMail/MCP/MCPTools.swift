@@ -304,41 +304,42 @@ enum MCPTools {
             name: "move_to_junk",
             description: """
             Move messages by rowid to the Junk (Spam) mailbox of their
-            account. For Gmail accounts this resolves to `[Gmail]/Spam`.
+            account.
 
-            **VERIFYING THE MOVE — IMPORTANT.** Gmail (and most IMAP servers)
-            REASSIGNS the rowid when a message changes mailboxes. The
-            original rowid you passed in is no longer valid after a
-            successful move — a NEW rowid exists in Spam for the same
-            message (same RFC Message-ID, same subject, same sender).
+            **REQUIRES authorized backend.** Each message's account must
+            have a server-direct writeback backend configured:
+              - **Gmail accounts:** authorize via FMail Settings → Gmail
+                accounts → "Authorize…". Uses Gmail REST API directly.
+                Sub-second per message; rock solid.
+              - **Other accounts (iCloud, IMAP):** Phase B2 (not shipped
+                yet). Until then, move-to-junk is unavailable for these
+                accounts.
 
-            ✗ Do NOT verify by `get_email {rowid: <original>}` — that rowid
-              no longer points to anything (or worse, points to stale state
-              briefly).
-            ✓ DO verify by `search_emails {query: "from:<sender>
-              subject:<subj>"}` after a 5–10s delay, or by checking
-              `search_emails` returns fewer matches in the source mailbox.
+            **AppleScript fallback was REMOVED.** macOS Tahoe broke the
+            underlying AppleScript path for junk-mailbox resolution
+            (universally — verified against every account in a real setup),
+            so it stayed timing out forever even with retries. Now if no
+            authorized backend exists for a message's account, the call
+            fails immediately with a clear error rather than hanging.
 
-            FMail triggers an immediate index sync after a successful move,
-            so the new state is usually visible within 5 seconds.
+            **Verifying the move (Gmail).** Gmail reassigns rowids when a
+            message changes mailboxes (label change → new internal id).
+            The original rowid you passed in is invalid after success.
+              ✗ Do NOT verify with `get_email {rowid: <original>}`.
+              ✓ Verify with `search_emails {query: "from:<sender>
+                subject:<subj>"}` after a 5–10s delay; FMail triggers an
+                immediate sync after a successful move so the new state
+                is usually visible within 5 seconds.
 
-            **Timing note:** Mail.app performs an IMAP MOVE for each message
-            synchronously. This takes 5–30s per message against Gmail and can
-            exceed your HTTP client's timeout for batches larger than 1–2
-            messages. **If the call times out, the move usually still
-            completes on Mail.app's side.** Wait ~30–60s and verify per the
-            note above.
+            **Errors.** If `error` is set, the most likely cause is that
+            the account holding the message isn't authorized for Gmail
+            API. Suggest the user open FMail Settings and authorize. Tell
+            them which account address the rowid belongs to (visible via
+            `get_email {rowid:}` in the `to` field) so they know which
+            account to authorize.
 
-            For batches: keep ≤ ~5 messages per call to stay under most
-            HTTP timeouts, OR accept that the call may time out and verify
-            after.
-
-            Accounts with no junk mailbox configured (some IMAP accounts —
-            check via `diagnose_junk_mailboxes` if unsure) will get the
-            junk-status flag set locally but no actual move; `applied`
-            still reports the count.
-
-            Returns `applied` and `error` like `mark_read`.
+            Returns `applied` (count successfully moved) and `error`
+            (string when any message failed).
             """,
             inputSchema: .object([
                 "type": .string("object"),

@@ -14,9 +14,18 @@ struct AppleScriptWritebackService: WritebackService {
     }
 
     func moveToJunk(_ messages: [MessageRef]) async -> WritebackResult {
-        let entries = messages.map { Self.batchEntry(from: $0) }
-        let result = await MailScripter.moveToJunkBatch(entries)
-        return Self.translate(result, messages: messages)
+        // Hard-failed: macOS Tahoe broke `junk mailbox of <account>` for
+        // every account in observed setups, and `move msg to <Spam mbox>`
+        // over Gmail IMAP wedges Mail.app's AppleEvent queue for minutes
+        // at a time. After ~3 weeks of trying to make this work via
+        // AppleScript we concluded it's unfixable at that layer.
+        // Authorize the Gmail account in Settings (uses Gmail API
+        // directly) or wait for IMAP support (Phase B2).
+        var out = WritebackResult.empty()
+        let msg = "AppleScript move-to-junk is unsupported (macOS Tahoe broke the junk-mailbox lookup). Authorize this Gmail account in FMail Settings to use the Gmail API directly, or wait for Phase B2 IMAP support."
+        out.error = msg
+        for ref in messages { out.perMessage[ref.appleRowId] = .failed(msg) }
+        return out
     }
 
     func delete(_ messages: [MessageRef]) async -> WritebackResult {

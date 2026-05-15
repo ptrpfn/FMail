@@ -22,7 +22,9 @@ Replace `MailScripter`'s move/delete path with a routing layer that picks per ac
 - **Gmail account → Gmail REST API.** Sub-second moves. Stable message IDs. No rowid reassignment surprises. Modern OAuth.
 - **iCloud account → IMAP** using an app-specific password (iCloud doesn't support OAuth for IMAP).
 - **Other IMAP accounts** (digitalhandstand, brakeless.net, etc.) → IMAP using a username/password (or OAuth where supported).
-- **No credentials configured for an account → AppleScript fallback.** Same code path as today, accepted to be flaky on Tahoe, surfaced to the user as "configure server credentials for reliable writes."
+- **No credentials configured for an account:**
+  - `mark_read`, `delete` → AppleScript fallback (still works, sometimes slowly).
+  - `move_to_junk` → **hard-fail with a clear error.** AppleScript junk move is removed because Tahoe broke `junk mailbox of <account>` for every account in observed setups; "fallback" just meant indefinite timeouts. User must authorize the account or wait for B2.
 
 `mark_read` is a separate question — AppleScript's `set read status of msg to true` is local and fast, generally still works on Tahoe. Phase B0 keeps it as-is and only changes move/delete. Phase B3 may unify if there's a reason.
 

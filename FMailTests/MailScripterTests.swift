@@ -46,195 +46,12 @@ final class MailScripterTests: XCTestCase {
         )
     }
 
-    // MARK: — Junk action shape
-
-    func testMoveToJunkActionSetsJunkStatusFirst() {
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(
-            action.contains("set junk mail status of msg to true"),
-            "junk action must always flag the message — this is fast, local, and trains Gmail's filter even when the subsequent move fails. Action was:\n\(action)"
-        )
-    }
-
-    func testMoveToJunkActionWrapsJunkStatusInTry() {
-        // Without the try, a failure on `set junk mail status` bubbles out
-        // of `repeat with msg in matches` and skips `set foundCount + 1`,
-        // making the script silently report notFound.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        let lines = action.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let statusIdx = lines.firstIndex(of: "set junk mail status of msg to true") else {
-            return XCTFail("status line missing:\n\(action)")
-        }
-        XCTAssertEqual(lines[statusIdx - 1], "try", "expected `try` immediately before status set")
-        XCTAssertEqual(lines[statusIdx + 1], "end try", "expected `end try` immediately after status set")
-    }
-
-    // (Was `testMoveToJunkActionWrapsMoveInIgnoringApplicationResponses` —
-    //  the wrap turned out to silently drop the move when osascript
-    //  terminated first. Replaced by
-    //  `testMoveToJunkActionDoesNotUseIgnoringApplicationResponses`.)
-
-    func testMoveToJunkActionWalksMailboxesByName() {
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(action.contains("repeat with cMbox in (mailboxes of theAccount)"))
-        // Common spam/junk mailbox names we expect to recognise.
-        XCTAssertTrue(action.contains("\"Spam\""), "must check for `Spam` (Gmail's leaf name)")
-        XCTAssertTrue(action.contains("\"Junk\""), "must check for `Junk` (iCloud / generic)")
-        XCTAssertTrue(action.contains("\"[Gmail]/Spam\""), "must check the slash-joined form Gmail accounts sometimes expose")
-    }
-
-    func testMoveToJunkActionUsesNameWalkBeforeProperty() {
-        // The `junk mailbox of <account>` property is unreliable — verified
-        // via diagnose_junk_mailboxes that it errors for every account in
-        // some Mail.app setups. So name-walk should run FIRST; the property
-        // is the last-resort fallback when no name matches.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        guard
-            let walkRange = action.range(of: "repeat with cMbox in (mailboxes of theAccount)"),
-            let propertyRange = action.range(of: "set tgtMbox to junk mailbox of theAccount")
-        else { return XCTFail("expected both walk and property in action:\n\(action)") }
-        XCTAssertLessThan(
-            walkRange.lowerBound, propertyRange.lowerBound,
-            "name walk must appear before the property lookup — the property is unreliable; walking is the safer first attempt."
-        )
-    }
-
-    func testMoveToJunkActionStillTriesAccountJunkMailboxAsFallback() {
-        // Even though the property is unreliable for some users, we still
-        // try it last in case the user's setup has Junk in an unrecognized
-        // name but the property works.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(
-            action.contains("set tgtMbox to junk mailbox of theAccount"),
-            "junk action must still try `junk mailbox of <account>` as a last-resort fallback"
-        )
-        // And the property is only attempted when the walk didn't find a match.
-        XCTAssertTrue(
-            action.contains("if tgtMbox is missing value"),
-            "the property fallback must be gated on the walk having found nothing"
-        )
-    }
-
-    func testMoveToJunkActionDoesTheActualMoveLast() {
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(
-            action.contains("move msg to tgtMbox"),
-            "junk action must perform the actual move via `move msg to tgtMbox` once tgtMbox is resolved. Action was:\n\(action)"
-        )
-    }
-
-    func testMoveToJunkActionDoesNotUseIgnoringApplicationResponses() {
-        // We tried wrapping the move in `ignoring application responses` to
-        // make the AppleScript return fast — but the move silently no-op'd
-        // because Mail.app's AppleEvent queue drops the event when osascript
-        // terminates first. The script returned `applied: N` but messages
-        // stayed in their source mailbox. We accept slower MCP responses in
-        // exchange for moves that actually happen.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertFalse(
-            action.contains("ignoring application responses"),
-            "must NOT wrap the move in `ignoring application responses` — it silently no-ops on Mail.app's side. Action was:\n\(action)"
-        )
-    }
-
-    func testMoveToJunkActionUsesMoveVerbNotSetMailbox() {
-        // `move` is the canonical AppleScript verb for cross-mailbox moves
-        // and is more reliable for Gmail's label-based store than the
-        // equivalent `set mailbox of msg to <mbox>` assignment.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(action.contains("move msg to tgtMbox"))
-        XCTAssertFalse(
-            action.contains("set mailbox of msg"),
-            "use the `move` verb, not the `set mailbox of msg to <mbox>` form"
-        )
-    }
-
-    func testMoveToJunkActionReferencesCorrectAccountVariable() {
-        let theAccount = MailScripter.moveToJunkAction(accountVar: "theAccount")
-        XCTAssertTrue(theAccount.contains("junk mailbox of theAccount"))
-        XCTAssertFalse(theAccount.contains("junk mailbox of anAccount"))
-
-        let anAccount = MailScripter.moveToJunkAction(accountVar: "anAccount")
-        XCTAssertTrue(anAccount.contains("junk mailbox of anAccount"))
-        XCTAssertFalse(anAccount.contains("junk mailbox of theAccount"))
-    }
-
-    // MARK: — Whole-script construction
-
-    func testJunkScriptIncludesAccountScopedBlockForGmail() {
-        let source = MailScripter.buildScriptSource(
-            entries: [gmailEntry()],
-            accountScopedAction: MailScripter.moveToJunkAction(accountVar: "theAccount"),
-            crossAccountAction: MailScripter.moveToJunkAction(accountVar: "anAccount")
-        )
-        let s = try? XCTUnwrap(source)
-        XCTAssertNotNil(s)
-        guard let s else { return }
-        // The Gmail account scoping should land in the account-scoped block.
-        XCTAssertTrue(s.contains("email addresses of acc) contains \"felix@gmail.com\""))
-        // Should target both leaf and slash-joined names of [Gmail]/All Mail.
-        XCTAssertTrue(s.contains("\"All Mail\""))
-        XCTAssertTrue(s.contains("\"[Gmail]/All Mail\""))
-        // Junk action must be expanded inline.
-        XCTAssertTrue(s.contains("set junk mail status of msg to true"))
-        XCTAssertTrue(s.contains("set tgtMbox to junk mailbox of theAccount"))
-        // Foundation: foundCount tracking + return.
-        XCTAssertTrue(s.contains("set foundCount to 0"))
-        XCTAssertTrue(s.contains("return foundCount"))
-        // 10-min internal timeout still in place.
-        XCTAssertTrue(s.contains("with timeout of 600 seconds"))
-    }
-
-    func testJunkScriptIncludesCrossAccountFallbackWhenAccountInfoMissing() {
-        let source = MailScripter.buildScriptSource(
-            entries: [fallbackEntry()],
-            accountScopedAction: MailScripter.moveToJunkAction(accountVar: "theAccount"),
-            crossAccountAction: MailScripter.moveToJunkAction(accountVar: "anAccount")
-        )
-        let s = try? XCTUnwrap(source)
-        XCTAssertNotNil(s)
-        guard let s else { return }
-        // Cross-account fallback iterates `accounts`.
-        XCTAssertTrue(s.contains("repeat with anAccount in accounts"))
-        // Action variant references `anAccount` not `theAccount`.
-        XCTAssertTrue(s.contains("set tgtMbox to junk mailbox of anAccount"))
-        XCTAssertFalse(s.contains("set tgtMbox to junk mailbox of theAccount"),
-                       "fallback-only script shouldn't contain the theAccount variant")
-    }
-
-    func testJunkScriptIncludesBothBranchesForMixedEntries() {
-        // Mixed: one Gmail entry (account-scoped), one with no info (fallback).
-        let source = MailScripter.buildScriptSource(
-            entries: [gmailEntry(rowId: 100), fallbackEntry(rowId: 300)],
-            accountScopedAction: MailScripter.moveToJunkAction(accountVar: "theAccount"),
-            crossAccountAction: MailScripter.moveToJunkAction(accountVar: "anAccount")
-        )
-        let s = try? XCTUnwrap(source)
-        guard let s else { return }
-        XCTAssertTrue(s.contains("set tgtMbox to junk mailbox of theAccount"))
-        XCTAssertTrue(s.contains("set tgtMbox to junk mailbox of anAccount"))
-        XCTAssertTrue(s.contains("repeat with anAccount in accounts"))
-    }
-
-    func testJunkScriptGroupsMultipleEntriesInSameMailbox() {
-        // Three messages from the same Gmail All Mail mailbox — should
-        // produce ONE per-mailbox scan with `id = 100 or id = 101 or id = 102`,
-        // not three separate scans.
-        let entries = [
-            gmailEntry(rowId: 100),
-            gmailEntry(rowId: 101),
-            gmailEntry(rowId: 102)
-        ]
-        let source = MailScripter.buildScriptSource(
-            entries: entries,
-            accountScopedAction: MailScripter.moveToJunkAction(accountVar: "theAccount"),
-            crossAccountAction: MailScripter.moveToJunkAction(accountVar: "anAccount")
-        )
-        let s = try? XCTUnwrap(source)
-        guard let s else { return }
-        // The OR-chain should appear in the script (chunked at 5 IDs).
-        XCTAssertTrue(s.contains("id = 100 or id = 101 or id = 102"))
-    }
+    // (Junk-action tests removed when AppleScriptWritebackService.moveToJunk
+    //  was hard-failed. macOS Tahoe broke the underlying `junk mailbox of
+    //  <account>` AppleScript property for every account in practice;
+    //  authorize Gmail via OAuth or wait for IMAP support instead. The
+    //  whole moveToJunkBatch + moveToJunkAction code path is gone.
+    //  setReadStatus and delete via AppleScript are still tested below.)
 
     // MARK: — Delete still works for all mailboxes
 
@@ -277,20 +94,27 @@ final class MailScripterTests: XCTestCase {
     // MARK: — Multi-line action indentation
 
     func testMultiLineActionPreservesAllLinesInsideRepeatLoop() {
-        // Regression: when actions grew from a single line to multi-line
-        // (junk), `makeLookupBlock` originally only indented the first line,
-        // dumping the rest at column 0 — which compiles in AppleScript but
-        // makes the output unreadable and risks accidental wrong-scope.
-        // The fix indents every line; assert by inspection.
-        let action = MailScripter.moveToJunkAction(accountVar: "theAccount")
+        // Regression: makeLookupBlock originally only indented the first
+        // line of a multi-line action, dumping the rest at column 0 —
+        // compiles in AppleScript but unreadable. Fix indents every line.
+        // Use a synthetic multi-line action so this test outlives the
+        // junk-specific code that motivated it.
+        let action = """
+        try
+            set junk mail status of msg to true
+        end try
+        if true then
+            move msg to mbox
+        end if
+        """
         let source = MailScripter.buildScriptSource(
             entries: [gmailEntry()],
             accountScopedAction: action,
             crossAccountAction: action
         )
         guard let s = source else { XCTFail("nil script"); return }
-        // Every non-blank line from the junk action should be at some
-        // indent ≥ 8 spaces (the makeLookupBlock body indent) inside the
+        // Every non-blank line from the action should be at some indent
+        // ≥ 8 spaces (the makeLookupBlock body indent) inside the
         // script. Find the first occurrence and walk forward.
         let actionLines = action
             .split(separator: "\n", omittingEmptySubsequences: false)

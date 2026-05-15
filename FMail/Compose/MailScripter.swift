@@ -103,83 +103,14 @@ enum MailScripter {
         )
     }
 
-    /// Move a batch of messages to the Junk (Spam) mailbox of their
-    /// account. Three-step action so it's resilient to Mail.app accounts
-    /// where `junk mailbox of <account>` returns `missing value` (observed
-    /// for some Gmail setups — symptom is move-to-junk silently no-ops):
-    ///   1. `set junk mail status of msg to true` — fast, local, always
-    ///      works, also trains Gmail's spam filter.
-    ///   2. Try `junk mailbox of <account>`; if missing, walk
-    ///      `mailboxes of <account>` looking for a name match against
-    ///      "Spam" / "Junk" / common Gmail variants.
-    ///   3. `set mailbox of msg to tgtMbox` — the actual move.
-    /// The action references the account variable in scope, which differs
-    /// between the account-scoped block (`theAccount`) and the cross-account
-    /// fallback (`anAccount`).
-    static func moveToJunkBatch(_ entries: [BatchEntry]) async -> Result {
-        await runActionBatch(
-            entries: entries,
-            accountScopedAction: moveToJunkAction(accountVar: "theAccount"),
-            crossAccountAction: moveToJunkAction(accountVar: "anAccount")
-        )
-    }
-
-    /// The multi-line "move to junk" AppleScript action, parameterized on
-    /// which AppleScript variable holds the account reference at the call
-    /// site. Internal for testability — see `MailScripterTests`.
-    ///
-    /// Decisions, in the order we learned them the hard way:
-    ///   1. `set junk mail status` is wrapped in `try` so a failure there
-    ///      (e.g. a read-only Gmail label view) doesn't bubble out of the
-    ///      outer `repeat with msg in matches` and skip the foundCount
-    ///      increment.
-    ///   2. Name walk runs FIRST; `junk mailbox of <account>` only as last
-    ///      resort. The `junk mailbox` property is unreliable: verified via
-    ///      `diagnose_junk_mailboxes` that it errors for every account in
-    ///      some Mail.app configurations (macOS Tahoe).
-    ///   3. **No `ignoring application responses`**. We tried wrapping the
-    ///      move to make the script return fast — turned out Mail.app's
-    ///      AppleEvent queue drops the move when osascript terminates
-    ///      before it processes the event, so the script reported `applied:N`
-    ///      but messages stayed in their source mailbox. Trade-off: the MCP
-    ///      call now blocks until Mail.app finishes the IMAP MOVE (5–30s per
-    ///      message, more for big batches), and may exceed the LLM client's
-    ///      HTTP timeout — but the move actually completes on Mail.app's
-    ///      side. The tool description tells the LLM to expect this and
-    ///      verify via `search_emails` after a delay.
-    ///   4. `move msg to tgtMbox` instead of `set mailbox of msg to tgtMbox`.
-    ///      Both are documented as equivalent but `move` is the canonical
-    ///      verb for cross-mailbox moves and appears to be more reliable
-    ///      for Gmail's label-based store.
-    static func moveToJunkAction(accountVar: String) -> String {
-        """
-        try
-            set junk mail status of msg to true
-        end try
-        set tgtMbox to missing value
-        try
-            repeat with cMbox in (mailboxes of \(accountVar))
-                try
-                    set cName to name of cMbox
-                    if cName is "Spam" or cName is "Junk" or cName is "Spam mail" or cName is "Bulk Mail" or cName is "[Gmail]/Spam" then
-                        set tgtMbox to cMbox
-                        exit repeat
-                    end if
-                end try
-            end repeat
-        end try
-        if tgtMbox is missing value then
-            try
-                set tgtMbox to junk mailbox of \(accountVar)
-            end try
-        end if
-        if tgtMbox is not missing value then
-            try
-                move msg to tgtMbox
-            end try
-        end if
-        """
-    }
+    // moveToJunkBatch + moveToJunkAction were removed in commit <see git log>.
+    // After ~3 weeks of trying to make AppleScript-driven junk move work
+    // reliably on macOS Tahoe (`junk mailbox of <account>` errors
+    // universally; `move msg to <Spam mbox>` over Gmail IMAP wedges
+    // Mail.app's AppleEvent queue), we concluded it's unfixable at this
+    // layer. AppleScriptWritebackService.moveToJunk now returns an
+    // explicit "unsupported" instead of silently failing. Server-direct
+    // backends (Gmail API in B1, IMAP in B2) handle junk reliably.
 
     // MARK: — Shared scaffold
 
