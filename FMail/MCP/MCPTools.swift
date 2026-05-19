@@ -297,7 +297,7 @@ enum MCPTools {
                     "max_bytes": .object([
                         "type": .string("integer"),
                         "minimum": .int(0),
-                        "default": .int(10_000_000),
+                        "default": .int(Int64(AttachmentDefaults.maxBase64Bytes)),
                         "description": .string("Only used when save_to_path is unset. Cap on raw (pre-base64) bytes returned. Larger attachments come back with truncated=true.")
                     ])
                 ]),

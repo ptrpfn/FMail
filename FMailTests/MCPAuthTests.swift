@@ -9,11 +9,18 @@ import Network
 final class MCPAuthTests: XCTestCase {
 
     private var savedToken: String = ""
+    private var savedTunnelURL: String = ""
 
     override func setUp() {
         super.setUp()
         savedToken = MCPSettings.authToken
+        savedTunnelURL = MCPSettings.tunnelPublicURL
         MCPSettings.authToken = ""
+        // Wipe the tunnel-public-URL too: the fail-closed auth path
+        // (`MCPServer.denyIfMissingAuth`) refuses unauthenticated
+        // requests when a tunnel is configured, which would invert the
+        // expected behaviour of the no-auth tests below.
+        MCPSettings.tunnelPublicURL = ""
         // Tests share UserDefaults with the host app, so OAuth sessions
         // persisted by another test (or a real local run) would flip
         // the no-auth path off. Wipe to a known state.
@@ -25,6 +32,7 @@ final class MCPAuthTests: XCTestCase {
 
     override func tearDown() {
         MCPSettings.authToken = savedToken
+        MCPSettings.tunnelPublicURL = savedTunnelURL
         MainActor.assumeIsolated {
             OAuthStore.shared.revokeAllSessions()
             OAuthStore.shared.closeApprovalWindow()

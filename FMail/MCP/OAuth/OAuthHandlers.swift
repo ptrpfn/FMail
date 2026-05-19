@@ -81,8 +81,8 @@ enum OAuthHandlers {
         guard let clientID = query["client_id"], !clientID.isEmpty else {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "Missing client_id."))
         }
-        guard let redirectURI = query["redirect_uri"], URL(string: redirectURI) != nil else {
-            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "Missing or malformed redirect_uri."))
+        guard let redirectURI = query["redirect_uri"], isAllowedRedirectURI(redirectURI) else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "Missing or unsupported redirect_uri. Only http/https schemes are accepted."))
         }
         guard let codeChallenge = query["code_challenge"], !codeChallenge.isEmpty else {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "Missing code_challenge (PKCE is required)."))
@@ -127,6 +127,11 @@ enum OAuthHandlers {
                 message: "Approval form was missing required fields."
             ))
         }
+        guard isAllowedRedirectURI(redirectURI) else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
+                message: "redirect_uri scheme not allowed."
+            ))
+        }
         let method = form["code_challenge_method"] ?? "S256"
         let state = form["state"] ?? ""
 
@@ -152,9 +157,9 @@ enum OAuthHandlers {
     @MainActor
     static func authorizeDeny(form: [String: String]) -> Data {
         // Per RFC 6749 §4.1.2.1, deny redirects back with `error=access_denied`.
-        guard let redirectURI = form["redirect_uri"] else {
+        guard let redirectURI = form["redirect_uri"], isAllowedRedirectURI(redirectURI) else {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
-                message: "Missing redirect_uri on deny."
+                message: "Missing or unsupported redirect_uri."
             ))
         }
         let state = form["state"] ?? ""
@@ -195,9 +200,11 @@ enum OAuthHandlers {
             let payload: [String: JSONValue] = [
                 "access_token": .string(accessToken),
                 "token_type": .string("Bearer"),
-                // Long-lived: clients keep using the token until the user
-                // revokes from Settings. 30 days is a hint, not a hard cap.
-                "expires_in": .int(2_592_000)
+                // Matches the server-side soft expiry in
+                // `OAuthStore.sessionTTL` — sessions older than this are
+                // dropped lazily by `tokenIsValid`. Clients re-auth via
+                // the dynamic-registration flow after expiry.
+                "expires_in": .int(Int64(OAuthStore.sessionTTL))
             ]
             let jsonBody = (try? JSONEncoder().encode(JSONValue.object(payload))) ?? Data("{}".utf8)
             // OAuth requires Cache-Control: no-store on the token response.
@@ -256,6 +263,18 @@ enum OAuthHandlers {
 
     private static func percentEncode(_ s: String) -> String {
         s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
+    }
+
+    /// Restrict `redirect_uri` to web schemes (`http`, `https`). Without
+    /// this, anyone who can reach `/authorize` can craft a URL whose
+    /// approval/deny redirect sends the user to a `javascript:` or
+    /// `data:` URI when they click — a small open-redirect surface.
+    /// `URL(string:)` alone would accept those.
+    static func isAllowedRedirectURI(_ s: String) -> Bool {
+        guard let url = URL(string: s), let scheme = url.scheme?.lowercased() else {
+            return false
+        }
+        return scheme == "http" || scheme == "https"
     }
 }
 

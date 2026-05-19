@@ -118,7 +118,7 @@ enum BodyCleaner {
             out = out.replacingOccurrences(
                 of: rule.pattern,
                 with: rule.replacement,
-                options: .regularExpression
+                options: [.regularExpression, .caseInsensitive]
             )
         }
         return out

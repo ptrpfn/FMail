@@ -227,17 +227,30 @@ actor MCPServer {
     }
 
     /// Returns a 401 response when the required bearer token is missing or
-    /// wrong. Returns nil when auth is disabled (no static token AND no
-    /// OAuth sessions) or the request carries a recognised token.
+    /// wrong. Returns nil when auth is disabled AND the server isn't
+    /// exposed via a tunnel, or the request carries a recognised token.
+    ///
+    /// Fail-closed behaviour: if `MCPSettings.tunnelPublicURL` is set
+    /// (i.e. the user has configured a Cloudflare tunnel) but neither
+    /// auth source is populated, we refuse every request. Without this,
+    /// clearing the static token in Settings while a tunnel is running
+    /// would silently make the server reachable on the public Internet
+    /// with no authentication.
     @MainActor
     private func denyIfMissingAuth(_ request: HTTPRequestLine) -> Data? {
         let staticToken = MCPSettings.authToken
         let presented = bearerToken(in: request.headers["authorization"] ?? "")
         let hasStaticToken = !staticToken.isEmpty
         let hasSessions = !OAuthStore.shared.sessions.isEmpty
+        let tunnelConfigured = !MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces).isEmpty
 
         if !hasStaticToken && !hasSessions {
-            // No auth configured at all → loopback-only legacy behaviour.
+            if tunnelConfigured {
+                Log.mcp.error("MCP rejected request: tunnel configured but no auth token / OAuth sessions — refusing to serve unauthenticated requests")
+                return unauthorizedResponse(reason: "tunnel-configured-no-auth")
+            }
+            // No auth configured AND no tunnel → loopback-only legacy
+            // behaviour; the listener is bound to 127.0.0.1 only.
             return nil
         }
         // Accept static token OR any active OAuth session token.
@@ -245,12 +258,20 @@ actor MCPServer {
         if !presented.isEmpty, OAuthStore.shared.tokenIsValid(presented) { return nil }
 
         Log.mcp.info("MCP rejected request: missing/invalid bearer token")
+        return unauthorizedResponse(reason: "missing-or-invalid-token")
+    }
+
+    /// Build the standard 401 response with the OAuth discovery hint.
+    /// Shared between the fail-closed and bad-token paths.
+    @MainActor
+    private func unauthorizedResponse(reason: String) -> Data {
         let body = Data(#"{"error":"unauthorized"}"#.utf8)
         // The MCP authorization spec discovers OAuth via the
         // `resource_metadata=...` parameter on this header. Without it,
         // remote clients can't find `/.well-known/oauth-protected-resource`
         // and the connector flow fails before it ever reaches /authorize.
         let metadataURL = "\(currentIssuer)/.well-known/oauth-protected-resource"
+        _ = reason  // kept for log-grep symmetry with the call sites
         return HTTPParser.formatResponse(
             status: 401,
             body: body,
@@ -318,6 +339,13 @@ actor MCPServer {
                 }
             }
             guard let chunk else { return nil }
+            // A zero-byte chunk means NW had nothing to deliver but the
+            // connection isn't done. Don't burn CPU waiting — yield so
+            // the next receive call sees fresh data.
+            if chunk.isEmpty {
+                await Task.yield()
+                continue
+            }
             accumulated.append(chunk)
 
             do {

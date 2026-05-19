@@ -234,16 +234,27 @@ enum HTTPParser {
             let value = line[line.index(after: colonIdx)...].trimmingCharacters(in: .whitespaces)
             headers[key] = String(value)
             if key == "content-length" {
-                contentLength = Int(value) ?? 0
+                // Negative or non-numeric → treat as 0 (the parser will
+                // return an empty body). A negative value would otherwise
+                // produce `bodyEnd < bodyStart` and crash `subdata(in:)`.
+                let parsed = Int(value) ?? 0
+                contentLength = max(0, min(parsed, Self.maxBodyBytes))
             }
         }
 
         let bodyStart = endRange.upperBound
         let bodyEnd = bodyStart + contentLength
+        if bodyEnd < bodyStart { return nil }  // overflow defence
         if data.count < bodyEnd { return nil }
         let body = data.subdata(in: bodyStart..<bodyEnd)
         return (HTTPRequestLine(method: method, path: path, query: query, headers: headers, body: body), bodyEnd)
     }
+
+    /// Hard cap on Content-Length we'll honour from a request header.
+    /// The transport layer also enforces a per-connection read cap
+    /// (`MCPServer.maxRequestBytes`); this is a second-line guard so a
+    /// malicious header can't push `bodyEnd` past `Int.max`.
+    static let maxBodyBytes = 32 * 1024 * 1024  // 32 MB
 
     /// Format an HTTP/1.1 response with a JSON body and `Connection: close`.
     /// `extraHeaders` adds key/value pairs verbatim (e.g.

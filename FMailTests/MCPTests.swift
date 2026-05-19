@@ -13,11 +13,14 @@ final class MCPTests: XCTestCase {
     /// flip the no-auth path on / off in tests that assume the legacy
     /// loopback behaviour.
     private var savedAuthToken: String = ""
+    private var savedTunnelURL: String = ""
 
     override func setUp() {
         super.setUp()
         savedAuthToken = MCPSettings.authToken
+        savedTunnelURL = MCPSettings.tunnelPublicURL
         MCPSettings.authToken = ""
+        MCPSettings.tunnelPublicURL = ""
         MainActor.assumeIsolated {
             OAuthStore.shared.revokeAllSessions()
             OAuthStore.shared.closeApprovalWindow()
@@ -26,6 +29,7 @@ final class MCPTests: XCTestCase {
 
     override func tearDown() {
         MCPSettings.authToken = savedAuthToken
+        MCPSettings.tunnelPublicURL = savedTunnelURL
         MainActor.assumeIsolated {
             OAuthStore.shared.revokeAllSessions()
             OAuthStore.shared.closeApprovalWindow()

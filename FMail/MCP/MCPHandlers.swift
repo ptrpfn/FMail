@@ -28,8 +28,8 @@ enum MCPHandlers {
         guard let rawQuery = obj["query"]?.stringValue, !rawQuery.isEmpty else {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "search_emails: `query` is required")
         }
-        let limit = clampInt(obj["limit"]?.intValue ?? 50, min: 1, max: 500)
-        let sort = SearchSort.parse(obj["sort"]?.stringValue)
+        let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 50, min: 1, max: 500)
+        let sort = try SearchSort.parseStrict(obj["sort"]?.stringValue)
         let includeAttachments = obj["include_attachment_metadata"]?.boolValue ?? false
 
         // Optional since/until — fold into the DSL by prefixing with after:/before:.
@@ -54,12 +54,24 @@ enum MCPHandlers {
         // Optional pass to load per-message attachment metadata. Costs
         // one body-load per result row; gated to avoid blowing up
         // payload size on 100-row searches.
+        //
+        // We distinguish three states on each result row:
+        //   - `attachments: nil`     → caller didn't request metadata
+        //   - `attachments: []`      → caller asked AND we successfully
+        //                              determined the message has none
+        //   - `attachments_unavailable: true` → load failed (body not on
+        //                              disk yet, etc.); the LLM should
+        //                              not interpret missing as "none"
         var attachmentsByRowid: [Int: [AttachmentRef]] = [:]
+        var attachmentsUnavailable: Set<Int> = []
         if includeAttachments {
             for m in messages {
                 guard let mb = try? await context.indexDB.loadMailbox(rowid: m.mailboxRowId),
                       let body = try? await context.bodyLoader.loadBody(messageRowId: m.rowId, mailbox: mb)
-                else { continue }
+                else {
+                    attachmentsUnavailable.insert(m.rowId)
+                    continue
+                }
                 attachmentsByRowid[m.rowId] = body.attachments.map {
                     AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count)
                 }
@@ -83,7 +95,8 @@ enum MCPHandlers {
                 thread_id: e?.threadId ?? m.rowId,
                 rfc_message_id: m.rfcMessageId,
                 body_on_disk: e?.bodyOnDisk ?? false,
-                attachments: attachmentsByRowid[m.rowId]
+                attachments: attachmentsByRowid[m.rowId],
+                attachments_unavailable: attachmentsUnavailable.contains(m.rowId) ? true : nil
             )
         }
         return try JSONValue.encoding(SearchEmailsResult(results: refs))
@@ -104,13 +117,13 @@ enum MCPHandlers {
 
     static func listThreads(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
         let obj = args.objectValue ?? [:]
-        let limit = clampInt(obj["limit"]?.intValue ?? 100, min: 1, max: 600)
+        let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 100, min: 1, max: 600)
         let unreadOnly = obj["unread_only"]?.boolValue ?? false
 
         // since/until are post-filtered in Swift since loadAllThreadSummaries /
         // loadThreadSummaries don't accept date predicates. Fine at limit ≤ 600.
-        let sinceDate = obj["since"]?.stringValue.flatMap(parseISODate)
-        let untilDate = obj["until"]?.stringValue.flatMap(parseISODate)
+        let sinceDate = try obj["since"]?.stringValue.flatMap { try requireValidDate($0, field: "since") }
+        let untilDate = try obj["until"]?.stringValue.flatMap { try requireValidDate($0, field: "until") }
 
         let summaries: [ThreadSummary]
         switch obj["scope"] {
@@ -156,12 +169,12 @@ enum MCPHandlers {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "get_thread: `thread_id` (integer) is required")
         }
         let includeBodies = obj["include_bodies"]?.boolValue ?? true
-        let maxBodyChars = clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
-        let bodyFormat = BodyFormat.parse(obj["body_format"]?.stringValue)
+        let maxBodyChars = MCPHelpers.clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
+        let bodyFormat = try BodyFormat.parseStrict(obj["body_format"]?.stringValue)
         // 0 = no cap. Clamped to a sane max (1 MB) so a malicious caller
         // can't ask for the moon.
-        let maxTotalChars = clampInt(obj["max_total_chars"]?.intValue ?? 0, min: 0, max: 1_000_000)
-        let direction = ThreadDirection.parse(obj["direction"]?.stringValue)
+        let maxTotalChars = MCPHelpers.clampInt(obj["max_total_chars"]?.intValue ?? 0, min: 0, max: 1_000_000)
+        let direction = try ThreadDirection.parseStrict(obj["direction"]?.stringValue)
 
         let messages = try await context.indexDB.loadThreadMessages(threadId: threadId, scope: .excludeDrafts)
         var full = try await buildEmailFulls(
@@ -212,8 +225,8 @@ enum MCPHandlers {
         else {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "get_email: `rowid` (integer) is required")
         }
-        let maxBodyChars = clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
-        let bodyFormat = BodyFormat.parse(obj["body_format"]?.stringValue)
+        let maxBodyChars = MCPHelpers.clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
+        let bodyFormat = try BodyFormat.parseStrict(obj["body_format"]?.stringValue)
 
         guard let msg = try await context.indexDB.loadMessage(rowid: rowid) else {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "get_email: no message with rowid \(rowid)")
@@ -360,19 +373,16 @@ enum MCPHandlers {
 
 // MARK: — Helpers
 
-private func clampInt(_ v: Int, min lo: Int, max hi: Int) -> Int {
-    Swift.max(lo, Swift.min(hi, v))
-}
-
-/// Parse YYYY, YYYY-MM, or YYYY-MM-DD as a Date at start-of-period UTC.
-/// Returns nil for anything else.
-private func parseISODate(_ s: String) -> Date? {
-    var components = DateComponents()
-    components.timeZone = TimeZone(identifier: "UTC")
-    let parts = s.split(separator: "-").map(String.init)
-    guard let y = parts.first.flatMap(Int.init) else { return nil }
-    components.year = y
-    components.month = parts.count >= 2 ? Int(parts[1]) : 1
-    components.day = parts.count >= 3 ? Int(parts[2]) : 1
-    return Calendar(identifier: .gregorian).date(from: components)
+/// Parse a date supplied by the client; throw an `invalidParams` error
+/// when the string is non-empty but unparseable so callers don't silently
+/// degrade to nil (and skip the filter entirely).
+private func requireValidDate(_ s: String, field: String) throws -> Date? {
+    guard !s.isEmpty else { return nil }
+    guard let date = MCPHelpers.parseISODate(s) else {
+        throw JSONRPCErrorPayload(
+            code: JSONRPCErrorCode.invalidParams,
+            message: "\(field): expected ISO date (YYYY, YYYY-MM, or YYYY-MM-DD), got \"\(s)\""
+        )
+    }
+    return date
 }

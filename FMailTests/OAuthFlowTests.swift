@@ -15,11 +15,14 @@ import Network
 final class OAuthFlowTests: XCTestCase {
 
     private var savedToken: String = ""
+    private var savedTunnelURL: String = ""
 
     override func setUp() {
         super.setUp()
         savedToken = MCPSettings.authToken
+        savedTunnelURL = MCPSettings.tunnelPublicURL
         MCPSettings.authToken = ""
+        MCPSettings.tunnelPublicURL = ""
         // Each test starts with a clean OAuthStore — we can't replace the
         // singleton, but we can wipe its state.
         MainActor.assumeIsolated {
@@ -30,6 +33,7 @@ final class OAuthFlowTests: XCTestCase {
 
     override func tearDown() {
         MCPSettings.authToken = savedToken
+        MCPSettings.tunnelPublicURL = savedTunnelURL
         MainActor.assumeIsolated {
             OAuthStore.shared.revokeAllSessions()
             OAuthStore.shared.closeApprovalWindow()

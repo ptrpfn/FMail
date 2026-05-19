@@ -64,11 +64,15 @@ actor MCPDispatcher {
         } catch let payload as JSONRPCErrorPayload {
             return .response(encode(JSONRPCResponse.failure(id: id, error: payload)))
         } catch {
+            // Log the full Swift error (with type info) locally; ship
+            // only the localized description to the wire so Swift type
+            // names don't leak to clients.
+            Log.mcp.error("MCP internal error on \(req.method, privacy: .public): \(String(describing: error), privacy: .public)")
             return .response(encode(JSONRPCResponse.failure(
                 id: id,
                 error: JSONRPCErrorPayload(
                     code: JSONRPCErrorCode.internalError,
-                    message: String(describing: error)
+                    message: error.localizedDescription
                 )
             )))
         }

@@ -31,8 +31,13 @@ enum MCPSettings {
     }
 
     /// Bearer token required on every request when non-empty. Empty string
-    /// disables auth (local-loopback-only mode — current behaviour for
-    /// users who don't expose via a tunnel).
+    /// disables static-token auth.
+    ///
+    /// Empty + no active OAuth sessions + no `tunnelPublicURL` set →
+    /// server runs anonymously on loopback (legacy local-only behaviour).
+    /// Empty + no sessions + `tunnelPublicURL` set → the server fails
+    /// closed and refuses every request (see `MCPServer.denyIfMissingAuth`).
+    /// Set this token (or pair via OAuth) before exposing via a tunnel.
     static var authToken: String {
         get { UserDefaults.standard.string(forKey: authTokenKey) ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: authTokenKey) }

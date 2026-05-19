@@ -37,7 +37,15 @@ struct EmailRef: Codable, Sendable {
     /// — gated because populating this requires loading the body of
     /// every result row from disk and would balloon row size on
     /// 100-result searches.
+    ///
+    /// Distinguish three states:
+    ///   - `nil` and `attachments_unavailable` nil → caller didn't ask
+    ///   - `[]`  and `attachments_unavailable` nil → no attachments
+    ///   - `nil` and `attachments_unavailable == true` → load failed
+    ///     (typically `.emlx` not on disk yet); the LLM should not
+    ///     interpret "missing" as "none".
     let attachments: [AttachmentRef]?
+    let attachments_unavailable: Bool?
 }
 
 struct AttachmentRef: Codable, Sendable {
@@ -177,9 +185,18 @@ enum SearchSort: String, Sendable {
     case oldestFirst = "oldest_first"
     case relevance
 
-    static func parse(_ s: String?) -> SearchSort {
+    /// Strict parse: when the caller supplies an unknown explicit value
+    /// we throw `invalidParams` rather than silently picking the
+    /// default. Nil / missing keeps the documented default.
+    static func parseStrict(_ s: String?) throws -> SearchSort {
         guard let s = s?.lowercased() else { return .newestFirst }
-        return SearchSort(rawValue: s) ?? .newestFirst
+        guard let v = SearchSort(rawValue: s) else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "sort: expected one of newest_first / oldest_first / relevance, got \"\(s)\""
+            )
+        }
+        return v
     }
 }
 
@@ -201,9 +218,17 @@ enum BodyFormat: String, Sendable {
     case plain
     case clean
 
-    static func parse(_ s: String?) -> BodyFormat {
+    /// Strict parse: throws `invalidParams` on an unknown explicit value
+    /// so a client typo doesn't silently degrade to the default.
+    static func parseStrict(_ s: String?) throws -> BodyFormat {
         guard let s = s?.lowercased() else { return .plain }
-        return BodyFormat(rawValue: s) ?? .plain
+        guard let v = BodyFormat(rawValue: s) else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "body_format: expected one of raw / plain / clean, got \"\(s)\""
+            )
+        }
+        return v
     }
 }
 
@@ -212,19 +237,20 @@ enum ThreadDirection: String, Sendable {
     case oldestFirst = "oldest_first"
     case newestFirst = "newest_first"
 
-    static func parse(_ s: String?) -> ThreadDirection {
+    static func parseStrict(_ s: String?) throws -> ThreadDirection {
         guard let s = s?.lowercased() else { return .oldestFirst }
-        return ThreadDirection(rawValue: s) ?? .oldestFirst
+        guard let v = ThreadDirection(rawValue: s) else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "direction: expected oldest_first or newest_first, got \"\(s)\""
+            )
+        }
+        return v
     }
 }
 
 struct FindUnansweredThreadsResult: Codable, Sendable {
     let threads: [UnansweredThread]
-}
-
-struct MarkReadResult: Codable, Sendable {
-    let applied: Int
-    let error: String?
 }
 
 // MARK: — Date / encoding helpers

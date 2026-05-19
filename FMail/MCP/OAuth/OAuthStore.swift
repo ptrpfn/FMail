@@ -34,6 +34,12 @@ final class OAuthStore {
 
     nonisolated static let codeTTL: TimeInterval = 600  // 10 minutes per RFC 6749 §4.1.2
 
+    /// Issued session lifetime — after this many seconds since
+    /// `issuedAt`, `tokenIsValid` returns false and the client is
+    /// expected to re-authenticate. Mirrors the `expires_in` value
+    /// returned to clients at `/token`.
+    nonisolated static let sessionTTL: TimeInterval = 30 * 24 * 60 * 60  // 30 days
+
     private var pendingCodes: [String: PendingCode] = [:]
 
     /// Generate a fresh authorization code and store the round-trip
@@ -45,6 +51,7 @@ final class OAuthStore {
         redirectURI: String,
         clientID: String
     ) -> String {
+        gcExpiredPendingCodes()
         let code = randomToken(byteCount: 32)
         pendingCodes[code] = PendingCode(
             challenge: challenge,
@@ -54,6 +61,15 @@ final class OAuthStore {
             createdAt: Date()
         )
         return code
+    }
+
+    /// Drop codes that have aged out so an attacker poking `/authorize/approve`
+    /// can't grow `pendingCodes` without bound. Called opportunistically on
+    /// every issue/exchange — at our scale (low single-digit OAuth grants
+    /// ever) explicit periodic sweep isn't worth the complexity.
+    private func gcExpiredPendingCodes() {
+        let cutoff = Date().addingTimeInterval(-Self.codeTTL)
+        pendingCodes = pendingCodes.filter { $0.value.createdAt > cutoff }
     }
 
     /// Consume an authorization code (one-time use). Verifies PKCE +
@@ -66,6 +82,7 @@ final class OAuthStore {
         redirectURI: String,
         clientID: String
     ) -> Result<String, OAuthExchangeError> {
+        gcExpiredPendingCodes()
         guard let pending = pendingCodes[code] else {
             return .failure(.invalidGrant("unknown or already-used authorization code"))
         }
@@ -109,8 +126,17 @@ final class OAuthStore {
 
     private(set) var sessions: [String: Session] = [:]
 
+    /// True iff the token is in `sessions` AND was issued within the
+    /// last `sessionTTL`. Expired sessions are dropped lazily on this
+    /// call — no periodic sweep needed at our scale.
     func tokenIsValid(_ token: String) -> Bool {
-        return sessions[token] != nil
+        guard let session = sessions[token] else { return false }
+        if Date().timeIntervalSince(session.issuedAt) > Self.sessionTTL {
+            sessions.removeValue(forKey: token)
+            persistSessions()
+            return false
+        }
+        return true
     }
 
     func revokeAllSessions() {
@@ -126,15 +152,14 @@ final class OAuthStore {
     // MARK: — Dynamic client registration
 
     /// Issue a stable `client_id` for a newly-registered MCP client. We
-    /// don't bother differentiating clients — the single-user model
-    /// means every grant flows through one approval anyway. The client
-    /// secret is empty (we're a "public client" using PKCE).
+    /// don't differentiate clients — the single-user model means every
+    /// grant flows through one approval anyway. The client secret is
+    /// empty (we're a "public client" using PKCE). The supplied `name`
+    /// is currently ignored; it's accepted because RFC 7591 callers
+    /// supply it and we may want to surface it in the Settings UI.
     func registerClient(name: String?) -> (clientID: String, clientSecret: String) {
-        let id = randomToken(byteCount: 24)
-        // Could persist the (id, name) pair if we ever wanted per-client
-        // policies; for now we just trust whoever has the id and a valid
-        // PKCE round-trip.
         _ = name
+        let id = randomToken(byteCount: 24)
         return (id, "")
     }
 
