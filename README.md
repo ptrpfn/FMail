@@ -39,6 +39,7 @@ FMail reads Apple Mail's `~/Library/Mail/V*/` store **read-only**, mirrors the m
 - **Mark as Read / Mark as Unread** via Mail.app (AppleScript) — Mail.app still gets the change so it propagates to the IMAP server.
 - **Zero network connections by default.** No outbound traffic, no telemetry. The only network FMail ever makes is when you explicitly click "Load remote images" on a specific message.
 - **Apple's Gmail label model handled** — `[Gmail]/All Mail` is the canonical store, INBOX/Sent/Important are labels; FMail mirrors the labels table and shows them correctly.
+- **Optional read-only MCP server** for local LLM clients (Claude Code, claude.ai connectors) — search, read threads, fetch attachments to disk. Off by default. Bearer-token auth + opt-in Cloudflare-tunnel toggle for remote clients. See [MCP server](#mcp-server) below.
 
 ## Search syntax
 
@@ -58,19 +59,22 @@ The search bar takes a structured query. Adjacent terms are AND-ed; everything c
 
 | Operator (and aliases) | Matches | Example |
 |---|---|---|
-| `from:` | sender (address or display name) | `from:kyoko` |
-| `to:` | "To:" recipient | `to:me` |
+| `from:` | sender (address or display name); domain-style works | `from:kyoko`, `from:savills.com` |
+| `to:` | "To:" recipient; domain-style works | `to:me`, `to:savills.com` |
 | `cc:` | "Cc:" recipient | `cc:anna` |
 | `subject:` *(or `subj:`)* | subject only | `subject:invoice` |
 | `body:` *(or `content:`, `text:`)* | body content only | `body:meeting` |
 | `attachment:` *(or `filename:`)* | attachment filename | `attachment:invoice.pdf` |
+| `thread:<id>` | scope to one conversation — useful with `body:` to grep within a thread | `thread:1234 body:"550k"` |
 | `account:` | scope to one account (email, or UUID prefix) | `account:gmail.com` |
 | `in:` | scope to mailbox kind: `inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`, `all` | `in:sent` |
 | `is:read` / `is:unread` / `is:flagged` *(or `is:starred`)* / `is:unflagged` *(or `is:unstarred`)* | flag scope | `is:unread` |
 | `has:attachment` *(or `has:attachments`, `has:att`)* | attachment scope | `has:attachment` |
 | `before:DATE` | strictly before start of period | `before:2026-03` |
-| `after:DATE` *(or `since:DATE`)* | from a date onwards (see semantics below) | `after:2024` |
+| `after:DATE` *(or `since:DATE`)* | from start of the period onwards — inclusive | `after:2024` |
 | `on:DATE` / `during:DATE` | the entire period (year / month / day) | `during:2025` |
+
+Values for `from:` / `to:` / `cc:` / `attachment:` are split on non-alphanumeric characters, so `from:savills.com` ANDs the tokens `savills` and `com` against the sender column and matches any `@savills.com` address. (FTS5's tokeniser breaks email addresses at `@` and `.`, so a single-token search would miss them.)
 
 **No-colon shortcuts** also work as bare words: `hasattachment` (or `hasattachments`), `isunread`, `isread`, `isflagged` (or `isstarred`).
 
@@ -86,15 +90,15 @@ The search bar takes a structured query. Adjacent terms are AND-ed; everything c
 
 ### Date-bound semantics
 
-`before:` is exclusive of the period; `after:` for partial dates is **after the period** (Gmail-style); `during:` / `on:` matches the whole period at the precision you typed:
+`before:` is exclusive of the period start; `after:` (and its alias `since:`) is inclusive of the period start; `during:` / `on:` matches the whole period at the precision you typed:
 
 | Query | Means |
 |---|---|
 | `before:2026` | `< 2026-01-01` |
 | `before:2026-03` | `< 2026-03-01` |
-| `after:2024` | `>= 2025-01-01` (after all of 2024) |
-| `after:2024-03` | `>= 2024-04-01` (after March 2024) |
-| `after:2024-03-15` | `>= 2024-03-15` (inclusive — full date) |
+| `after:2024` | `>= 2024-01-01` (Gmail-style — inclusive) |
+| `after:2024-03` | `>= 2024-03-01` |
+| `after:2024-03-15` | `>= 2024-03-15` |
 | `during:2025` | all of 2025 |
 | `during:2025-03` | all of March 2025 |
 | `during:2025-03-15` | that one day |
@@ -140,33 +144,72 @@ xcodebuild -project FMail.xcodeproj -scheme FMail -configuration Debug build
 
 The `.xcodeproj` is generated from `project.yml` and not checked in.
 
-## Gmail OAuth setup (optional)
+## MCP server
 
-macOS Tahoe broke Mail.app's AppleScript bridge for several mailbox-resolution operations — Move to Junk and similar can silently no-op or hang. FMail can bypass this by talking to the Gmail REST API directly for accounts that authorize it; AppleScript stays as a fallback for accounts that don't. See [`WRITEBACK_PLAN.md`](WRITEBACK_PLAN.md) for the architecture.
+FMail ships an optional **read-only** MCP (Model Context Protocol) server that exposes the index to local LLM clients. Off by default; enable in Settings → MCP. When enabled, it listens on `127.0.0.1:8765` and accepts JSON-RPC over HTTP/POST.
 
-The OAuth client is per-fork — Google's terms expect each redistribution to register its own. Five-minute one-time setup:
+### What's exposed
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com/) → create or pick a project.
-2. **APIs & Services → Library** → enable **Gmail API**.
-3. **APIs & Services → OAuth consent screen** → User Type: External. Add yourself as a Test User. Scopes: `https://www.googleapis.com/auth/gmail.modify`.
-4. **APIs & Services → Credentials** → Create Credentials → OAuth Client ID → Application type: **Desktop app**. Copy both the **Client ID** (`REDACTED_GOOGLE_OAUTH_CLIENT_ID`) and the **Client Secret** (`GOCSPX-…`).
-5. Paste both into `FMail/Writeback/Gmail/GmailOAuthConfig.swift`:
-   ```swift
-   static let clientID = "YOUR-CLIENT-ID.apps.googleusercontent.com"
-   static let clientSecret = "REDACTED_GOOGLE_OAUTH_CLIENT_SECRET"
-   ```
-6. Rebuild. Settings → "Gmail accounts" now lists each detected Gmail address with an "Authorize…" button.
+Eight tools, all non-destructive — Mail state changes happen through FMail's UI or Mail.app directly, never through MCP. Read-only by design so it's safe to expose over a tunnel.
 
-Why the secret in source for a public fork? Google's own [OAuth 2.0 for installed apps](https://developers.google.com/identity/protocols/oauth2/native-app) docs say: *"The client secret is not actually secret for installed apps. Anyone who can decompile your application can extract it."* They still require it on the token endpoint as a client-identifier; PKCE (RFC 7636) is what actually protects against code interception. Each fork's OAuth project is independently rate-limited, so misuse of your fork's credentials is your problem, not upstream's. If you'd rather not commit the secret, move it to a gitignored helper file — the field just needs to be readable as `GmailOAuthConfig.clientSecret`.
+| Tool | Purpose |
+|---|---|
+| `search_emails` | The DSL above. Returns `account_email` / `rfc_message_id` / `body_on_disk` per row. Optional `include_attachment_metadata: true` adds attachment metadata per row (gated — costs one body load per result). Optional `sort: newest_first | oldest_first | relevance`. |
+| `list_threads` | Thread summaries (mailbox-scoped or All Mailboxes). |
+| `list_accounts` | Introspection — which accounts FMail has indexed; tells you which `account:` filter values are valid. |
+| `get_thread` | All messages in a thread. `body_format: "clean"` strips quoted reply chains, signatures, and known tracking-URL wrappers (Mimecast, Outlook safelinks, etc.) — typically shrinks long threads 5–10×. `max_total_chars` budgets the whole thread; `direction` toggles oldest/newest first. |
+| `get_email` | One message by rowid. Accepts the same `body_format`. |
+| `get_attachment` | One attachment's bytes by rowid + 0-based index. With `save_to_path` the server writes the decoded file to disk and returns metadata + `saved_path` (no payload-size cap — the right path for any non-trivial PDF). Without it, returns `data_base64` (default 10 MB cap). |
+| `get_attachments_for_rowids` | Bulk variant — writes every attachment of every supplied rowid to `save_dir/<rowid>/<filename>`. |
+| `find_unanswered_threads` | Threads where you sent the latest message and haven't heard back. |
 
-If you skip this step, FMail still works — Gmail accounts just fall back to AppleScript for writebacks (with the Tahoe-flakiness caveats above).
+### Setting it up (local Claude Code)
+
+Settings → MCP server → toggle on. Then in Settings → "Set up your MCP client" → **Copy local Claude Code config** writes the right JSON snippet to your clipboard. Paste it into `~/.claude/settings.json` under `mcpServers`. Restart Claude Code; the `mcp__fmail__*` tools appear.
+
+### Bearer-token auth
+
+By default the server is loopback-only (`requiredInterfaceType = .loopback`), which is fine for local use. If you want to expose it more widely (see tunnel below), generate a token from Settings → "Auth Token" → **Generate token**. Once a token is set, every request must include `Authorization: Bearer <token>` or it's rejected with HTTP 401. The "Copy" buttons in Settings bake the header into the JSON snippet for you.
+
+### Cloudflare tunnel (for remote clients like claude.ai connectors)
+
+FMail can spawn a `cloudflared` child process and route a public hostname through to its loopback MCP endpoint. Settings → MCP → "Cloudflare Tunnel".
+
+One-time setup in Terminal:
+
+```bash
+brew install cloudflared
+cloudflared tunnel login
+cloudflared tunnel create fmail
+cloudflared tunnel route dns fmail fmail.your-domain.com
+```
+
+Then in FMail Settings:
+
+1. **Auth Token** → Generate (required before the tunnel can be opened).
+2. **Cloudflare Tunnel** → Tunnel name = `fmail`, Public URL = `https://fmail.your-domain.com`.
+3. Click **Open tunnel**. A red banner appears at the top of the FMail window and a red dot in the footer; status flips to "Running".
+
+To pair with claude.ai's "Custom Connector" flow (which requires OAuth, not a static token):
+
+4. **OAuth Pairing** → Click **Open approval window (5 min)**.
+5. In claude.ai / Cowork → add custom connector → paste `https://fmail.your-domain.com/mcp`.
+6. claude.ai will open FMail's `/authorize` page in your browser; click **Approve**. The OAuth-issued session token is persisted to UserDefaults, so the connector survives FMail restarts. Revoke any time from Settings → "Active sessions".
+
+The tunnel state itself is **not** persisted across launches — you have to click "Open tunnel" each time. This is deliberate: opening a public-internet ingress to your mail is an active security decision; the visible banner exists so "I forgot the tunnel was open" can't quietly happen.
+
+### Threat model (worth being honest about)
+
+- **Loopback-only mode, no token**: anything on your Mac that can connect to `127.0.0.1:8765` can read your mail. Same threat surface as anything else running as your user.
+- **Loopback + token**: as above, but only clients with the token can read. Still local.
+- **Tunnel + token**: your mail index is reachable from the public internet. The token is the only thing gating it. Keep the tunnel closed when you're not actively using it; the banner makes this hard to forget.
+- **OAuth session tokens** (claude.ai connector flow): persist across restarts. Revoke from Settings if a client is compromised.
 
 ## Design docs
 
 - [`FMailSpec.md`](FMailSpec.md) — design intent: pain points, architecture, phased plan.
 - [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — what actually shipped, deviations from the spec, file inventory, Phase 5 backlog.
 - [`MCP_PLAN.md`](MCP_PLAN.md) — MCP server design (loopback HTTP/JSON-RPC for LLM clients).
-- [`WRITEBACK_PLAN.md`](WRITEBACK_PLAN.md) — server-direct write path (Gmail API + IMAP) replacing the AppleScript move/delete bottleneck.
 
 ## License
 
