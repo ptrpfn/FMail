@@ -244,6 +244,7 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(Set(names), [
             "search_emails",
             "list_threads",
+            "list_accounts",
             "get_thread",
             "get_email",
             "get_attachment",

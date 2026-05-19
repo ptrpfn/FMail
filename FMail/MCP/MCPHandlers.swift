@@ -29,6 +29,8 @@ enum MCPHandlers {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "search_emails: `query` is required")
         }
         let limit = clampInt(obj["limit"]?.intValue ?? 50, min: 1, max: 500)
+        let sort = SearchSort.parse(obj["sort"]?.stringValue)
+        let includeAttachments = obj["include_attachment_metadata"]?.boolValue ?? false
 
         // Optional since/until — fold into the DSL by prefixing with after:/before:.
         var compiled = rawQuery
@@ -45,9 +47,24 @@ enum MCPHandlers {
             return try JSONValue.encoding(SearchEmailsResult(results: []))
         }
 
-        let messages = try await context.indexDB.search(compiledQ, limit: limit)
+        let messages = try await context.indexDB.search(compiledQ, limit: limit, sort: sort)
         let rowids = messages.map(\.rowId)
         let enrichments = try await context.indexDB.enrichForMCP(rowids: rowids)
+
+        // Optional pass to load per-message attachment metadata. Costs
+        // one body-load per result row; gated to avoid blowing up
+        // payload size on 100-row searches.
+        var attachmentsByRowid: [Int: [AttachmentRef]] = [:]
+        if includeAttachments {
+            for m in messages {
+                guard let mb = try? await context.indexDB.loadMailbox(rowid: m.mailboxRowId),
+                      let body = try? await context.bodyLoader.loadBody(messageRowId: m.rowId, mailbox: mb)
+                else { continue }
+                attachmentsByRowid[m.rowId] = body.attachments.map {
+                    AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count)
+                }
+            }
+        }
 
         let refs = messages.map { m -> EmailRef in
             let e = enrichments[m.rowId]
@@ -59,14 +76,28 @@ enum MCPHandlers {
                 date_sent: m.dateSent.mcpISO8601(),
                 date_received: m.dateReceived.mcpISO8601(),
                 mailbox_path: e?.mailboxPath ?? "",
+                account_email: e?.accountEmail,
                 is_read: m.isRead,
                 is_flagged: m.isFlagged,
                 has_attachment: e?.hasAttachment ?? false,
                 thread_id: e?.threadId ?? m.rowId,
-                body_on_disk: e?.bodyOnDisk ?? false
+                rfc_message_id: m.rfcMessageId,
+                body_on_disk: e?.bodyOnDisk ?? false,
+                attachments: attachmentsByRowid[m.rowId]
             )
         }
         return try JSONValue.encoding(SearchEmailsResult(results: refs))
+    }
+
+    // MARK: — list_accounts
+
+    static func listAccounts(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
+        _ = args
+        let accounts = try await context.indexDB.loadAccounts()
+        let refs = accounts.map {
+            AccountRef(uuid: $0.uuid, display_name: $0.displayName, email_address: $0.emailAddress)
+        }
+        return try JSONValue.encoding(ListAccountsResult(accounts: refs))
     }
 
     // MARK: — list_threads
@@ -126,15 +157,51 @@ enum MCPHandlers {
         }
         let includeBodies = obj["include_bodies"]?.boolValue ?? true
         let maxBodyChars = clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
+        let bodyFormat = BodyFormat.parse(obj["body_format"]?.stringValue)
+        // 0 = no cap. Clamped to a sane max (1 MB) so a malicious caller
+        // can't ask for the moon.
+        let maxTotalChars = clampInt(obj["max_total_chars"]?.intValue ?? 0, min: 0, max: 1_000_000)
+        let direction = ThreadDirection.parse(obj["direction"]?.stringValue)
 
         let messages = try await context.indexDB.loadThreadMessages(threadId: threadId, scope: .excludeDrafts)
-        let full = try await buildEmailFulls(
+        var full = try await buildEmailFulls(
             for: messages,
             includeBodies: includeBodies,
             maxBodyChars: maxBodyChars,
+            bodyFormat: bodyFormat,
             context: context
         )
-        return try JSONValue.encoding(GetThreadResult(messages: full))
+
+        // Apply direction. `messages` comes back chronological from the
+        // index; flip when newest-first requested.
+        if direction == .newestFirst {
+            full.reverse()
+        }
+
+        // Apply total-budget truncation. Keep messages in the iteration
+        // order set above (so newest-first prioritises latest, oldest-
+        // first prioritises earliest). Drop overflow from the tail.
+        var omittedCount = 0
+        if maxTotalChars > 0 {
+            var runningTotal = 0
+            var kept: [EmailFull] = []
+            kept.reserveCapacity(full.count)
+            for msg in full {
+                let nextTotal = runningTotal + msg.plain_text_body.count
+                if nextTotal > maxTotalChars && !kept.isEmpty {
+                    omittedCount = full.count - kept.count
+                    break
+                }
+                kept.append(msg)
+                runningTotal = nextTotal
+            }
+            full = kept
+        }
+
+        return try JSONValue.encoding(GetThreadResult(
+            messages: full,
+            omitted_message_count: omittedCount > 0 ? omittedCount : nil
+        ))
     }
 
     // MARK: — get_email
@@ -146,6 +213,7 @@ enum MCPHandlers {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "get_email: `rowid` (integer) is required")
         }
         let maxBodyChars = clampInt(obj["max_body_chars"]?.intValue ?? 8000, min: 0, max: 200_000)
+        let bodyFormat = BodyFormat.parse(obj["body_format"]?.stringValue)
 
         guard let msg = try await context.indexDB.loadMessage(rowid: rowid) else {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "get_email: no message with rowid \(rowid)")
@@ -154,6 +222,7 @@ enum MCPHandlers {
             for: [msg],
             includeBodies: true,
             maxBodyChars: maxBodyChars,
+            bodyFormat: bodyFormat,
             context: context
         )
         guard let one = full.first else {
@@ -177,14 +246,29 @@ enum MCPHandlers {
     ///        indicates whether content was cut
     /// `includeBodies=false` skips body parsing entirely (no attachments
     /// list, no plainText). Cheapest option for summary listings.
+    ///
+    /// `bodyFormat`:
+    ///   .plain  → the HTML-stripped text as produced by `HTMLStripper`
+    ///             (the historical default).
+    ///   .clean  → additionally pass through `BodyCleaner`: truncate at
+    ///             the first reply-chain marker and signature delimiter,
+    ///             collapse known tracking-URL wrappers, collapse blank
+    ///             lines. Designed for context-window-sensitive callers
+    ///             pulling long threads.
+    ///   .raw    → same as `.plain` for now (placeholder for if/when we
+    ///             expose the original HTML in the future).
     static func buildEmailFulls(
         for messages: [MessageHeader],
         includeBodies: Bool,
         maxBodyChars: Int,
+        bodyFormat: BodyFormat = .plain,
         context: MCPContext
     ) async throws -> [EmailFull] {
         let rowids = messages.map(\.rowId)
         let enrichments = try await context.indexDB.enrichForMCP(rowids: rowids)
+        // Reply-chain lookup: per rowid → rowid of in-reply-to message.
+        // One SQL for the whole set, joined to messages_links.
+        let inReplyTo = (try? await context.indexDB.inReplyToRowids(rowids)) ?? [:]
 
         // Cache mailbox lookups within this call (a thread often shares one).
         var mailboxCache: [Int: Mailbox?] = [:]
@@ -213,17 +297,23 @@ enum MCPHandlers {
                 }
                 if let mb,
                    let body = try? await context.bodyLoader.loadBody(messageRowId: m.rowId, mailbox: mb) {
-                    let displayText = body.displayText
-                    fullChars = displayText.count
+                    // Apply the format pass first; per-message and total
+                    // budgets work against the post-clean text length.
+                    let processed: String
+                    switch bodyFormat {
+                    case .clean: processed = BodyCleaner.clean(body.displayText)
+                    case .plain, .raw: processed = body.displayText
+                    }
+                    fullChars = processed.count
                     htmlPresent = body.html != nil && !(body.html ?? "").isEmpty
                     if maxBodyChars == 0 {
                         plainText = ""
-                        truncated = displayText.count > 0
-                    } else if displayText.count > maxBodyChars {
-                        plainText = String(displayText.prefix(maxBodyChars))
+                        truncated = processed.count > 0
+                    } else if processed.count > maxBodyChars {
+                        plainText = String(processed.prefix(maxBodyChars))
                         truncated = true
                     } else {
-                        plainText = displayText
+                        plainText = processed
                     }
                     attachments = body.attachments.map { a in
                         AttachmentRef(
@@ -243,6 +333,7 @@ enum MCPHandlers {
                 rowid: m.rowId,
                 thread_id: e?.threadId ?? m.rowId,
                 mailbox_path: e?.mailboxPath ?? "",
+                account_email: e?.accountEmail,
                 subject: m.subject,
                 sender_display: m.senderDisplay,
                 sender_address: m.senderAddress,
@@ -254,6 +345,7 @@ enum MCPHandlers {
                 is_read: m.isRead,
                 is_flagged: m.isFlagged,
                 rfc_message_id: m.rfcMessageId,
+                in_reply_to_rowid: inReplyTo[m.rowId],
                 body_on_disk: e?.bodyOnDisk ?? false,
                 plain_text_body: plainText,
                 plain_text_truncated: truncated,

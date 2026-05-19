@@ -16,6 +16,7 @@ enum MCPTools {
     static func registerReadTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
         await dispatcher.register(searchEmailsTool(context: context))
         await dispatcher.register(listThreadsTool(context: context))
+        await dispatcher.register(listAccountsTool(context: context))
         await dispatcher.register(getThreadTool(context: context))
         await dispatcher.register(getEmailTool(context: context))
         await dispatcher.register(getAttachmentTool(context: context))
@@ -50,11 +51,50 @@ enum MCPTools {
                     "until": .object([
                         "type": .string("string"),
                         "description": .string("Optional ISO date. Folded into the query as `before:`.")
+                    ]),
+                    "sort": .object([
+                        "type": .string("string"),
+                        "enum": .array([
+                            .string("newest_first"),
+                            .string("oldest_first"),
+                            .string("relevance")
+                        ]),
+                        "default": .string("newest_first"),
+                        "description": .string("Result ordering. newest_first is the default. `relevance` currently falls back to newest_first (FTS5 BM25 isn't surfaced through our IN-subquery shape yet).")
+                    ]),
+                    "include_attachment_metadata": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("When true, each result row includes `attachments: [{name, content_type, byte_count}]`. Costs one body load per result, so only enable when needed (e.g. 'find the email where Anita sent the contract PDF' workflows).")
                     ])
                 ]),
                 "required": .array([.string("query")])
             ]),
             handler: { args in try await MCPHandlers.searchEmails(args, context: context) }
+        )
+    }
+
+    // MARK: — list_accounts
+
+    private static func listAccountsTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "list_accounts",
+            description: """
+            Introspection: list the mail accounts FMail has indexed.
+            Returns `{uuid, display_name, email_address}` per account.
+
+            Use the email_address (or any substring of it) on the DSL
+            `account:` operator to filter `search_emails`. Most useful
+            when you're seeing two similar-looking results across
+            different mailboxes and want to know whether they're the
+            same message indexed under multiple accounts or actually
+            different.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([:])
+            ]),
+            handler: { args in try await MCPHandlers.listAccounts(args, context: context) }
         )
     }
 
@@ -105,11 +145,36 @@ enum MCPTools {
         MCPTool(
             name: "get_thread",
             description: """
-            Get all messages in a thread, oldest first. Returns full message
-            content including plain-text body and attachment metadata.
+            Get all messages in a thread. Returns full message content
+            including plain-text body and attachment metadata. Bytes for
+            attachments are not shipped — only name / content_type /
+            byte_count.
 
-            Body text is plain (HTML stripped). Bytes for attachments are not
-            shipped — only name / content_type / byte_count.
+            **body_format** controls how aggressively the body is
+            cleaned before truncation:
+              - `plain` (default): HTML stripped, otherwise verbatim.
+                Preserves quoted reply chains and signatures.
+              - `clean`: same as plain plus — strip everything below the
+                first reply-chain marker (`On <date> ... wrote:`,
+                `-----Original Message-----`, Outlook quoted-header
+                block); strip below the first signature delimiter
+                (`-- ` line, `Sent from my iPhone/iPad`, Outlook iOS
+                signature); collapse known tracking URLs (Mimecast
+                cybergraph, Outlook safelinks, Google AMP); collapse
+                blank lines. Designed for context-window-sensitive
+                callers pulling long threads — typically 5–10× smaller
+                payload on threads with quoted-reply chains and legal
+                disclaimer footers.
+              - `raw`: same as `plain` today; reserved for future use.
+
+            **max_total_chars**: cap on the SUM of plain-text bodies
+            across the whole thread (0 = no cap). When the cap would be
+            exceeded, messages are dropped from the tail of whatever
+            order is in effect — so with `direction: newest_first` the
+            oldest messages drop first. Response includes
+            `omitted_message_count` when truncation kicked in.
+
+            **direction**: `oldest_first` (default) or `newest_first`.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -125,6 +190,23 @@ enum MCPTools {
                         "maximum": .int(200000),
                         "default": .int(8000),
                         "description": .string("Per-message plain-text truncation cap. 0 disables body content (still returns headers/attachments).")
+                    ]),
+                    "body_format": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("plain"), .string("clean"), .string("raw")]),
+                        "default": .string("plain")
+                    ]),
+                    "max_total_chars": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "maximum": .int(1_000_000),
+                        "default": .int(0),
+                        "description": .string("Cap on the SUM of plain_text_body across all returned messages. 0 = no cap.")
+                    ]),
+                    "direction": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("oldest_first"), .string("newest_first")]),
+                        "default": .string("oldest_first")
                     ])
                 ]),
                 "required": .array([.string("thread_id")])
@@ -142,6 +224,10 @@ enum MCPTools {
             Fetch one message by rowid. Returns the same shape as items in
             `get_thread.messages`. Use after `search_emails` when you want to
             read a single result in detail.
+
+            `body_format` works the same as on `get_thread` — pass
+            `clean` to strip quoted reply chains, signatures, and
+            tracking URLs before truncation.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -152,6 +238,11 @@ enum MCPTools {
                         "minimum": .int(0),
                         "maximum": .int(200000),
                         "default": .int(8000)
+                    ]),
+                    "body_format": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("plain"), .string("clean"), .string("raw")]),
+                        "default": .string("plain")
                     ])
                 ]),
                 "required": .array([.string("rowid")])

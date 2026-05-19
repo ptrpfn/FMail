@@ -13,10 +13,18 @@ struct EmailRef: Codable, Sendable {
     let date_sent: String?
     let date_received: String?
     let mailbox_path: String
+    /// The email address of the account this message belongs to (e.g.
+    /// `felix@gmail.com`). Disambiguates "is this two copies of the same
+    /// message across accounts" vs "are these distinct messages" when
+    /// the same RFC Message-ID appears under multiple mailboxes.
+    let account_email: String?
     let is_read: Bool
     let is_flagged: Bool
     let has_attachment: Bool
     let thread_id: Int
+    /// RFC 2822 Message-ID. Useful for cross-system reference (e.g.
+    /// tying back to a Notion item that captured an email URL).
+    let rfc_message_id: String?
     /// True when the `.emlx` for this message has been parsed by
     /// FMail's body indexer. `get_email` / `get_thread` / `get_attachment`
     /// can return body / attachment content for these rows without
@@ -24,6 +32,12 @@ struct EmailRef: Codable, Sendable {
     /// work but can also fail with "body not on disk" — the LLM should
     /// prefer `body_on_disk:true` rows when there's a choice.
     let body_on_disk: Bool
+    /// Per-attachment metadata (no bytes). Only present when
+    /// `include_attachment_metadata: true` was passed to `search_emails`
+    /// — gated because populating this requires loading the body of
+    /// every result row from disk and would balloon row size on
+    /// 100-result searches.
+    let attachments: [AttachmentRef]?
 }
 
 struct AttachmentRef: Codable, Sendable {
@@ -83,6 +97,8 @@ struct EmailFull: Codable, Sendable {
     let rowid: Int
     let thread_id: Int
     let mailbox_path: String
+    /// Account email address. Same field as on `EmailRef`.
+    let account_email: String?
     let subject: String
     let sender_display: String
     let sender_address: String
@@ -94,6 +110,12 @@ struct EmailFull: Codable, Sendable {
     let is_read: Bool
     let is_flagged: Bool
     let rfc_message_id: String?
+    /// rowid of the message this one is in-reply-to, resolved via Apple
+    /// Mail's `message_links` table. nil when this message is the root
+    /// of its thread, or when the in-reply-to message isn't in the
+    /// local index. Useful for reconstructing parallel sub-conversations
+    /// inside long threads.
+    let in_reply_to_rowid: Int?
     /// See `EmailRef.body_on_disk`. Useful when the LLM is fanning out
     /// across thread members and wants to know which ones need a fetch.
     let body_on_disk: Bool
@@ -124,10 +146,41 @@ struct UnansweredThread: Codable, Sendable {
     let recipient_addresses: [String]
 }
 
+/// One row in `list_accounts` — the introspection tool that tells MCP
+/// clients which `account:` values they can filter `search_emails` on.
+struct AccountRef: Codable, Sendable {
+    /// Stable per-account identifier — the UUID of the directory under
+    /// `~/Library/Mail/V*/`. Same identifier as `account_email`'s row in
+    /// FMail's internal `accounts` table.
+    let uuid: String
+    /// User-facing display name (typically the email address).
+    let display_name: String
+    /// The detected email address for this account, when available.
+    /// `search_emails` accepts a substring of this on the `account:`
+    /// operator (e.g. `account:icloud`, `account:gmail`).
+    let email_address: String?
+}
+
+struct ListAccountsResult: Codable, Sendable {
+    let accounts: [AccountRef]
+}
+
 // MARK: — Result envelopes (one per tool)
 
 struct SearchEmailsResult: Codable, Sendable {
     let results: [EmailRef]
+}
+
+/// Sort orders for `search_emails`.
+enum SearchSort: String, Sendable {
+    case newestFirst = "newest_first"
+    case oldestFirst = "oldest_first"
+    case relevance
+
+    static func parse(_ s: String?) -> SearchSort {
+        guard let s = s?.lowercased() else { return .newestFirst }
+        return SearchSort(rawValue: s) ?? .newestFirst
+    }
 }
 
 struct ListThreadsResult: Codable, Sendable {
@@ -136,6 +189,33 @@ struct ListThreadsResult: Codable, Sendable {
 
 struct GetThreadResult: Codable, Sendable {
     let messages: [EmailFull]
+    /// Number of messages dropped because of the `max_total_chars` budget.
+    /// nil when no budget was supplied or no truncation was needed.
+    let omitted_message_count: Int?
+}
+
+/// Body cleanup mode for `get_thread` / `get_email`. See
+/// `MCPHandlers.buildEmailFulls` for what each option does.
+enum BodyFormat: String, Sendable {
+    case raw
+    case plain
+    case clean
+
+    static func parse(_ s: String?) -> BodyFormat {
+        guard let s = s?.lowercased() else { return .plain }
+        return BodyFormat(rawValue: s) ?? .plain
+    }
+}
+
+/// Message ordering inside a thread.
+enum ThreadDirection: String, Sendable {
+    case oldestFirst = "oldest_first"
+    case newestFirst = "newest_first"
+
+    static func parse(_ s: String?) -> ThreadDirection {
+        guard let s = s?.lowercased() else { return .oldestFirst }
+        return ThreadDirection(rawValue: s) ?? .oldestFirst
+    }
 }
 
 struct FindUnansweredThreadsResult: Codable, Sendable {

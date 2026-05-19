@@ -114,9 +114,11 @@ extension IndexDB {
                COALESCE(mb.path, '') AS mailbox_path,
                CASE WHEN m.thread_id = 0 THEN m.apple_rowid ELSE m.thread_id END AS thread_id,
                m.has_attachment,
-               m.body_indexed
+               m.body_indexed,
+               a.email_address
         FROM messages m
         LEFT JOIN mailboxes mb ON mb.apple_rowid = m.mailbox_rowid
+        LEFT JOIN accounts  a  ON a.uuid         = m.account_uuid
         WHERE m.apple_rowid IN (\(placeholders))
         """
         var stmt: OpaquePointer?
@@ -136,12 +138,46 @@ extension IndexDB {
             // succeed without a Mail.app IMAP round-trip" — surfaced as
             // `body_on_disk` in MCP result shapes.
             let bodyOnDisk = sqlite3_column_int(stmt, 4) != 0
+            let accountEmail = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
             out[rowid] = MCPMessageEnrichment(
                 mailboxPath: path,
                 threadId: tid,
                 hasAttachment: hasA,
-                bodyOnDisk: bodyOnDisk
+                bodyOnDisk: bodyOnDisk,
+                accountEmail: accountEmail
             )
+        }
+        return out
+    }
+
+    /// Resolve "this message replied to ..." via Apple's `message_links`
+    /// table. The join chain: `m → message_links (from_message_rowid =
+    /// m.apple_rowid, is_parent = 1) → messages (where
+    /// apple_message_id_hash = to_message_id_hash)`. Returns the
+    /// parent's `apple_rowid` per input rowid (nil when no parent is
+    /// known locally — root-of-thread, or the parent is unindexed).
+    func inReplyToRowids(_ rowids: [Int]) throws -> [Int: Int] {
+        guard !rowids.isEmpty else { return [:] }
+        let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
+        let sql = """
+        SELECT l.from_message_rowid, parent.apple_rowid
+        FROM message_links l
+        JOIN messages parent ON parent.apple_message_id_hash = l.to_message_id_hash
+        WHERE l.is_parent = 1
+          AND l.from_message_rowid IN (\(placeholders))
+        """
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        for (i, id) in rowids.enumerated() {
+            bind(stmt, Int32(i + 1), Int64(id))
+        }
+        var out: [Int: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let from = Int(sqlite3_column_int64(stmt, 0))
+            let to = Int(sqlite3_column_int64(stmt, 1))
+            // Multiple parents per message can exist (rare); first one wins.
+            if out[from] == nil { out[from] = to }
         }
         return out
     }
@@ -268,4 +304,5 @@ struct MCPMessageEnrichment: Sendable, Hashable {
     let threadId: Int
     let hasAttachment: Bool
     let bodyOnDisk: Bool
+    let accountEmail: String?
 }

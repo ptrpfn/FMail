@@ -569,14 +569,29 @@ actor IndexDB {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// Run a compiled search query and return matched messages, newest first.
-    /// The compiled query is a single SQL boolean expression on `messages m`;
+    /// Run a compiled search query and return matched messages. The
+    /// compiled query is a single SQL boolean expression on `messages m`;
     /// text predicates compile to `apple_rowid IN (SELECT rowid FROM messages_fts ...)`
     /// subqueries, so AND / OR / NOT all compose natively here. Search always
     /// excludes drafts/trash/junk (canonical or label) — to search inside one
     /// of those, navigate to that mailbox first.
-    func search(_ q: CompiledQuery, limit: Int = 200) throws -> [MessageHeader] {
+    ///
+    /// `sort`:
+    ///   .newestFirst (default): ORDER BY date_received DESC
+    ///   .oldestFirst:           ORDER BY date_received ASC
+    ///   .relevance:             ORDER BY rowid (proxy — true relevance
+    ///                           would need bm25() through messages_fts,
+    ///                           which requires restructuring the query
+    ///                           since text predicates compile to IN subqueries)
+    func search(_ q: CompiledQuery, limit: Int = 200, sort: SearchSort = .newestFirst) throws -> [MessageHeader] {
         guard q.hasAnyConstraint else { return [] }
+
+        let orderBy: String
+        switch sort {
+        case .newestFirst: orderBy = "m.date_received DESC"
+        case .oldestFirst: orderBy = "m.date_received ASC"
+        case .relevance:   orderBy = "m.date_received DESC"  // fallback
+        }
 
         let sql = """
         SELECT m.apple_rowid, m.mailbox_rowid,
@@ -587,7 +602,7 @@ actor IndexDB {
         FROM messages m
         WHERE (\(q.whereClause))
           AND \(Self.systemMailboxExcludeFilter)
-        ORDER BY m.date_received DESC LIMIT ?
+        ORDER BY \(orderBy) LIMIT ?
         """
         var bindings = q.bindings
         bindings.append(.int(Int64(limit)))
