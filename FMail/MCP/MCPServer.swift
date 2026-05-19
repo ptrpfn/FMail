@@ -121,7 +121,34 @@ actor MCPServer {
         }
 
         let responseBytes = await produceResponse(for: request)
+        logRequest(request, response: responseBytes)
         await writeAll(conn, data: responseBytes)
+    }
+
+    /// Log one access-log line per incoming request. Includes the status
+    /// code we returned + a hint about auth presence + the User-Agent so
+    /// "is Claude actually reaching the server?" / "what's it asking
+    /// for?" debugging works from `log stream`. Body content is NOT
+    /// logged — it might contain email subjects / addresses.
+    ///
+    /// View live:
+    ///   log stream --predicate 'subsystem == "com.felixmatschke.FMail" && category == "mcp"' --info
+    nonisolated private func logRequest(_ req: HTTPRequestLine, response: Data) {
+        let status = extractStatusCode(response) ?? 0
+        let pathWithQuery = req.query.isEmpty ? req.path : "\(req.path)?\(req.query)"
+        let ua = (req.headers["user-agent"] ?? "-").prefix(60)
+        let auth = req.headers["authorization"]?.isEmpty == false ? "yes" : "no"
+        Log.mcp.info("→ \(req.method, privacy: .public) \(pathWithQuery, privacy: .public) status=\(status, privacy: .public) auth=\(auth, privacy: .public) ua=\"\(ua, privacy: .public)\"")
+    }
+
+    /// Pull the integer status code out of a formatted response. The
+    /// response starts with `HTTP/1.1 <code> <text>\r\n`.
+    nonisolated private func extractStatusCode(_ data: Data) -> Int? {
+        guard let crlf = data.range(of: Data([0x0D, 0x0A])) else { return nil }
+        let line = String(data: data.subdata(in: 0..<crlf.lowerBound), encoding: .ascii) ?? ""
+        let parts = line.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2 else { return nil }
+        return Int(parts[1])
     }
 
     private func produceResponse(for request: HTTPRequestLine) async -> Data {
