@@ -132,10 +132,10 @@ actor MCPServer {
         //   unauthenticated by design; public-internet exposure is gated
         //   by the user-controlled approval window (see `OAuthStore`).
         if method == "GET" && path == "/.well-known/oauth-authorization-server" {
-            let issuer = MCPSettings.tunnelPublicURL.isEmpty
-                ? "http://127.0.0.1:\(MCPSettings.port)"
-                : MCPSettings.tunnelPublicURL
-            return OAuthHandlers.metadata(issuer: issuer)
+            return OAuthHandlers.metadata(issuer: currentIssuer)
+        }
+        if method == "GET" && path == "/.well-known/oauth-protected-resource" {
+            return OAuthHandlers.protectedResource(issuer: currentIssuer)
         }
         if method == "POST" && path == "/register" {
             return await MainActor.run { OAuthHandlers.register(body: request.body) }
@@ -219,11 +219,28 @@ actor MCPServer {
 
         Log.mcp.info("MCP rejected request: missing/invalid bearer token")
         let body = Data(#"{"error":"unauthorized"}"#.utf8)
+        // The MCP authorization spec discovers OAuth via the
+        // `resource_metadata=...` parameter on this header. Without it,
+        // remote clients can't find `/.well-known/oauth-protected-resource`
+        // and the connector flow fails before it ever reaches /authorize.
+        let metadataURL = "\(currentIssuer)/.well-known/oauth-protected-resource"
         return HTTPParser.formatResponse(
             status: 401,
             body: body,
-            extraHeaders: [("WWW-Authenticate", #"Bearer realm="fmail""#)]
+            extraHeaders: [("WWW-Authenticate", #"Bearer realm="fmail", resource_metadata="\#(metadataURL)""#)]
         )
+    }
+
+    /// Public origin the server identifies as. Used by the OAuth
+    /// metadata + 401 hints. When the tunnel is up, this is the public
+    /// hostname the user typed in Settings; otherwise the loopback URL.
+    /// Read on each request so a Settings edit takes effect without a
+    /// server restart.
+    nonisolated private var currentIssuer: String {
+        let public_ = MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces)
+        return public_.isEmpty
+            ? "http://127.0.0.1:\(MCPSettings.port)"
+            : public_
     }
 
     /// Extracts the token from a `Bearer <token>` header value. Tolerates

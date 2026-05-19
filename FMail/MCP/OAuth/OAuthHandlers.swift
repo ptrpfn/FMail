@@ -14,6 +14,17 @@ enum OAuthHandlers {
         return HTTPParser.formatResponse(status: 200, body: jsonBody)
     }
 
+    // MARK: — Protected-resource metadata (`GET /.well-known/oauth-protected-resource`)
+
+    /// RFC 9728. Discovered via the `WWW-Authenticate: ..., resource_metadata=...`
+    /// hint on the 401 response from `/mcp`. Tells the client to look for
+    /// the actual authorization-server metadata at `authorization_servers[0]`.
+    static func protectedResource(issuer: String) -> Data {
+        let body = OAuthMetadata.makeProtectedResource(issuer: issuer, resourcePath: MCPProtocol.mcpPath)
+        let jsonBody = (try? JSONEncoder().encode(JSONValue.object(body))) ?? Data("{}".utf8)
+        return HTTPParser.formatResponse(status: 200, body: jsonBody)
+    }
+
     // MARK: — Dynamic client registration (`POST /register`)
 
     @MainActor

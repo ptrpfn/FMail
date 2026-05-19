@@ -195,6 +195,48 @@ final class OAuthFlowTests: XCTestCase {
         XCTAssertEqual(pkceMethods, ["S256"])
     }
 
+    /// MCP authorization spec requires `/.well-known/oauth-protected-resource`
+    /// (RFC 9728) — clients hit this after seeing the
+    /// `WWW-Authenticate: ..., resource_metadata=...` hint on a 401.
+    /// The response points at the authorization server.
+    func testProtectedResourceEndpointReturnsExpectedShape() async throws {
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let resp = try await get(port: port, path: "/.well-known/oauth-protected-resource")
+        XCTAssertTrue(responseStatus(resp).hasPrefix("HTTP/1.1 200"))
+        let json = try parseJSONBody(resp)
+        let resource = try XCTUnwrap(json["resource"] as? String)
+        XCTAssertTrue(resource.hasSuffix("/mcp"), "resource must point at the MCP endpoint, got \(resource)")
+        let servers = try XCTUnwrap(json["authorization_servers"] as? [String])
+        XCTAssertEqual(servers.count, 1)
+        XCTAssertNotNil(URL(string: servers[0]))
+    }
+
+    /// Without `resource_metadata` on the 401 header, remote MCP clients
+    /// can't discover the OAuth flow at all — they'd just see "Unauthorized"
+    /// and give up. Regression guard for the Cowork-connector bug.
+    func testUnauthenticatedMCPRequestExposesResourceMetadataHint() async throws {
+        // Force auth on so the request actually 401s.
+        MCPSettings.authToken = "force-auth-required"
+        defer { MCPSettings.authToken = "" }
+
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let req = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        let raw = try await sendRaw(port: port, payload: Data(req.utf8))
+        XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 401"))
+        let headers = responseHeaderBlock(raw)
+        XCTAssertTrue(headers.lowercased().contains("www-authenticate:"))
+        XCTAssertTrue(headers.contains("resource_metadata="), "401 header must include resource_metadata pointing at /.well-known/oauth-protected-resource")
+        XCTAssertTrue(headers.contains("/.well-known/oauth-protected-resource"))
+    }
+
     // MARK: — Authorize page rendering
 
     func testAuthorizePageRendersWindowClosedNotice() async throws {

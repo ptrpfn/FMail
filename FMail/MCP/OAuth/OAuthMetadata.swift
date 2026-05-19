@@ -25,4 +25,19 @@ enum OAuthMetadata {
             "service_documentation": .string("https://github.com/flx/FMail")
         ]
     }
+
+    /// `/.well-known/oauth-protected-resource` response (RFC 9728). The
+    /// MCP authorization spec requires this — when a client gets 401 on
+    /// the MCP endpoint, the `WWW-Authenticate` header points here, and
+    /// the client follows the `authorization_servers` link to find the
+    /// `/.well-known/oauth-authorization-server` metadata above.
+    static func makeProtectedResource(issuer: String, resourcePath: String) -> [String: JSONValue] {
+        let base = issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return [
+            "resource": .string(base + resourcePath),
+            "authorization_servers": .array([.string(base)]),
+            "bearer_methods_supported": .array([.string("header")]),
+            "scopes_supported": .array([.string("mcp")])
+        ]
+    }
 }
