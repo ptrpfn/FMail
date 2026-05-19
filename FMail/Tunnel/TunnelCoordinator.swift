@@ -85,6 +85,9 @@ final class TunnelCoordinator {
     @ObservationIgnored
     private var readinessTask: Task<Void, Never>?
     @ObservationIgnored
+    /// Temp config.yml we write per-run; removed on stop / unexpected exit.
+    private var tempConfigPath: URL?
+    @ObservationIgnored
     private static let readinessTimeout: Duration = .seconds(15)
     @ObservationIgnored
     private static let stopTimeout: Duration = .seconds(5)
@@ -117,9 +120,16 @@ final class TunnelCoordinator {
         return nil
     }
 
-    /// Launch `cloudflared tunnel --url http://127.0.0.1:<port> run <name>`.
-    /// Idempotent: returns early if a process is already starting or running.
-    /// Failures land in `state = .error(...)` with a human-readable string.
+    /// Launch `cloudflared tunnel --config <tmp> run <name>`. We write a
+    /// temporary `config.yml` with explicit ingress rules every time
+    /// because `--url <localOrigin>` is silently ignored when combined
+    /// with `run <name>` — cloudflared then has no idea where to forward
+    /// edge traffic and Cloudflare returns HTTP 530 / error 1033 for
+    /// every request. The temp file is removed in `stop()`.
+    ///
+    /// Idempotent: returns early if a process is already starting or
+    /// running. Failures land in `state = .error(...)` with a
+    /// human-readable string.
     func start() async {
         if let refusal = refusalReason() {
             state = .error(refusal.userMessage)
@@ -129,8 +139,36 @@ final class TunnelCoordinator {
             state = .error(TunnelStartRefusal.cloudflaredMissing.userMessage)
             return
         }
+        guard let credentialsPath = CloudflaredLocator.findCredentialsFile() else {
+            state = .error("Couldn't find tunnel credentials in ~/.cloudflared/. Run `cloudflared tunnel create <name>` (one-time setup) to generate them.")
+            return
+        }
         let tunnelName = MCPSettings.tunnelName.trimmingCharacters(in: .whitespaces)
         let publicURL = URL(string: MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces))!
+        guard let publicHost = publicURL.host else {
+            state = .error("Public URL has no host component: \(publicURL.absoluteString)")
+            return
+        }
+
+        // Write the temp ingress config. Keep the path on the instance
+        // so `stop()` (and the termination handler) can clean up.
+        let configPath = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fmail-cloudflared-\(UUID().uuidString).yml")
+        let yaml = """
+        tunnel: \(tunnelName)
+        credentials-file: \(credentialsPath)
+        ingress:
+          - hostname: \(publicHost)
+            service: http://127.0.0.1:\(mcpPort())
+          - service: http_status:404
+        """
+        do {
+            try yaml.write(to: configPath, atomically: true, encoding: .utf8)
+        } catch {
+            state = .error("Failed to write tunnel config: \(error.localizedDescription)")
+            return
+        }
+        self.tempConfigPath = configPath
 
         state = .starting
         recentLogLines.removeAll()
@@ -140,7 +178,7 @@ final class TunnelCoordinator {
         proc.arguments = [
             "tunnel",
             "--no-autoupdate",
-            "--url", "http://127.0.0.1:\(mcpPort())",
+            "--config", configPath.path,
             "run", tunnelName
         ]
         let stdout = Pipe()
@@ -293,6 +331,7 @@ final class TunnelCoordinator {
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
         stdoutPipe = nil
         stderrPipe = nil
+        removeTempConfig()
     }
 
     private func cleanupAfterExit() {
@@ -301,6 +340,13 @@ final class TunnelCoordinator {
         // process is mid-exit.
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        removeTempConfig()
+    }
+
+    private func removeTempConfig() {
+        guard let path = tempConfigPath else { return }
+        try? FileManager.default.removeItem(at: path)
+        tempConfigPath = nil
     }
 
     private func killProcessImmediately() {

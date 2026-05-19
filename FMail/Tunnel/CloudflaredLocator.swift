@@ -39,4 +39,35 @@ enum CloudflaredLocator {
         let path = NSHomeDirectory() + "/.cloudflared/cert.pem"
         return fileManager.fileExists(atPath: path)
     }
+
+    /// Find the tunnel credentials JSON file written by
+    /// `cloudflared tunnel create <name>`. The file is named after the
+    /// tunnel's UUID (e.g. `e7a78b42-….json`) and lives in
+    /// `~/.cloudflared/`. Returns the path when exactly one such file is
+    /// present; nil if zero or more than one (in the multi-tunnel case
+    /// we'd need a Settings override to disambiguate — out of scope for v1).
+    static func findCredentialsFile(fileManager: FileManager = .default) -> String? {
+        let dir = NSHomeDirectory() + "/.cloudflared"
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: dir) else { return nil }
+        let candidates = entries.filter { name in
+            // UUID-formatted filename with .json extension. Skips
+            // cert.pem, config.yml, dotfiles, anything not matching the
+            // UUID layout.
+            name.hasSuffix(".json") && looksLikeUUIDFilename(name)
+        }
+        guard candidates.count == 1, let only = candidates.first else { return nil }
+        return dir + "/" + only
+    }
+
+    private static func looksLikeUUIDFilename(_ name: String) -> Bool {
+        let stem = name.replacingOccurrences(of: ".json", with: "")
+        let parts = stem.split(separator: "-")
+        guard parts.count == 5 else { return false }
+        let expectedLengths = [8, 4, 4, 4, 12]
+        for (i, part) in parts.enumerated() {
+            guard part.count == expectedLengths[i] else { return false }
+            for ch in part where !ch.isHexDigit { return false }
+        }
+        return true
+    }
 }
