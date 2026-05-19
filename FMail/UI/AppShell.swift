@@ -5,13 +5,7 @@ struct AppShell: View {
     @FocusState private var searchFocused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Loud red bar at top whenever tunnel state ≠ .off. Lives
-            // outside the loadState switch so it's visible even during
-            // bootstrap / index-rebuild paths.
-            TunnelBanner(model: model)
-
-            Group {
+        Group {
             switch model.loadState {
             case .idle, .bootstrapping:
                 ProgressView("Opening index…")
@@ -52,7 +46,15 @@ struct AppShell: View {
                     footerStatus
                 }
             }
-            }
+        }
+        // Loud red bar at top whenever tunnel state ≠ .off. We use
+        // `safeAreaInset` rather than wrapping in a VStack so the
+        // NavigationSplitView keeps its window-chrome integration —
+        // otherwise an empty toolbar band appears between the banner
+        // and the search bar. When the tunnel is off, `TunnelBanner`
+        // renders EmptyView and the inset takes zero space.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            TunnelBanner(model: model)
         }
         .task {
             await model.boot()
