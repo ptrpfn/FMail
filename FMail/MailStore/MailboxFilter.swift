@@ -1,7 +1,6 @@
 import Foundation
 
-/// Decides which mailboxes to hide from the sidebar by default. The user can
-/// flip a toggle in Settings (Phase 5) to show them.
+/// Decides which mailboxes to hide from the sidebar by default.
 enum MailboxFilter {
     /// Returns true if this mailbox should be hidden by default.
     /// Hidden by default:

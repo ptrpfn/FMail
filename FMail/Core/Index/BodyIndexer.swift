@@ -4,10 +4,9 @@ import Foundation
 /// extracts plain-text body, and adds it to FTS. Designed to run in the
 /// background as a long sweep that the user can interrupt by quitting.
 ///
-/// The plan calls this out as Phase 2 stage 2 / Phase 3 prerequisite. The
-/// metadata sync in `Indexer.runFullSync` populates FTS with subject + sender
-/// + recipients, so search works immediately for those fields. Body content
-/// becomes searchable as this sweep progresses.
+/// The metadata sync in `Indexer.runFullSync` populates FTS with subject +
+/// sender + recipients, so search works immediately for those fields. Body
+/// content becomes searchable as this sweep progresses.
 actor BodyIndexer {
     private let indexDB: IndexDB
     private let bodyLoader: BodyLoader
@@ -61,9 +60,10 @@ actor BodyIndexer {
                         let text = body.displayText
                         try await indexDB.setBodyText(messageRowId: entry.rowid, bodyText: text)
                     } else {
-                        // No .emlx on disk yet; mark with empty body so we move on.
-                        // FSEvents-driven incremental sync would re-trigger indexing
-                        // if the file appears later (Phase 5 enhancement).
+                        // No .emlx on disk yet; mark with empty body so we move
+                        // on. A later sync re-runs this sweep (and now drops the
+                        // BodyLoader cache), so the body is picked up once the
+                        // file appears.
                         try await indexDB.setBodyText(messageRowId: entry.rowid, bodyText: "")
                     }
                 } catch {

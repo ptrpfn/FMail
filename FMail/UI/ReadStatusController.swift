@@ -8,9 +8,27 @@ import Foundation
 /// in case Mail.app couldn't apply the change.
 @MainActor
 final class ReadStatusController {
+    // `unowned`: every entry point is invoked synchronously from the UI/MCP
+    // while the model is alive, and the model owns this controller — so it
+    // cannot outlive the model. (Long-lived background work uses `[weak
+    // model]` captures instead; see `dispatchAppleScript`.) Contrast
+    // `SyncCoordinator`, which keeps `weak` because it owns periodic/detached
+    // tasks that can fire during model teardown.
     private unowned let model: MailModel
 
     init(model: MailModel) { self.model = model }
+
+    /// How long to suppress FSEvents-triggered syncs around an AppleScript
+    /// write-back so the optimistic flip isn't reverted before Mail.app
+    /// commits the change to its Envelope Index.
+    private enum SkipWindow: TimeInterval {
+        case beforeDispatch = 120
+        case afterDispatch = 180
+    }
+
+    private func suppressSync(_ window: SkipWindow) {
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(window.rawValue)
+    }
 
     // MARK: — Public API
 
@@ -47,32 +65,16 @@ final class ReadStatusController {
 
         // Optimistic flip — same path as the existing fire-and-forget API,
         // inlined so we can interleave the awaitable AppleScript step.
-        let perThread: [(threadId: Int, messages: [MessageHeader])]
-        if let map = try? await db.threadIds(forMessages: resolved.map(\.rowId)) {
-            var byThread: [Int: [MessageHeader]] = [:]
-            for msg in resolved {
-                if let tid = map[msg.rowId] {
-                    byThread[tid, default: []].append(msg)
-                }
-            }
-            perThread = byThread.map { (threadId: $0.key, messages: $0.value) }
-        } else {
-            perThread = []
-        }
-        if !perThread.isEmpty {
-            applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
-        } else {
-            applyOptimisticReadFlags(messageRowIds: resolved.map(\.rowId), isRead: isRead)
-        }
+        await applyOptimisticReadFlip(messages: resolved, isRead: isRead)
 
         // AppleScript dispatch — awaited, not Task.detached.
         let entries = mailScripterEntries(for: resolved)
         guard !entries.isEmpty else {
             return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
         }
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        suppressSync(.beforeDispatch)
         let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+        suppressSync(.afterDispatch)
 
         switch result {
         case .ok(let matched):
@@ -141,14 +143,14 @@ final class ReadStatusController {
         guard !resolved.isEmpty else {
             return (0, "No messages matched the given rowids")
         }
-        applyOptimisticRemoval(messages: resolved)
+        await applyOptimisticRemoval(messages: resolved)
 
         let entries = mailScripterEntries(for: resolved)
         guard !entries.isEmpty else {
             return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
         }
 
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        suppressSync(.beforeDispatch)
         let result = await MailScripter.deleteBatch(entries)
 
         // On success: Gmail (and IMAP generally) reassigns apple_rowid when
@@ -162,21 +164,21 @@ final class ReadStatusController {
             await model.syncCoordinator?.runIncrementalSync()
             return (matched, nil)
         case .notFound:
-            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            suppressSync(.afterDispatch)
             return (0, "Mail.app couldn't find any of the selected messages — apple_rowid may be stale.")
         case .failed(let msg):
-            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            suppressSync(.afterDispatch)
             return (resolved.count, "AppleScript failed: \(msg)")
         }
     }
 
     private func applyAndDispatchDelete(messages: [MessageHeader]) async {
-        applyOptimisticRemoval(messages: messages)
+        await applyOptimisticRemoval(messages: messages)
 
         let entries = mailScripterEntries(for: messages)
         guard !entries.isEmpty else { return }
 
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        suppressSync(.beforeDispatch)
         Task.detached { [weak model] in
             let result = await MailScripter.deleteBatch(entries)
             switch result {
@@ -189,12 +191,12 @@ final class ReadStatusController {
                 }
             case .notFound:
                 await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
                     model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
                 }
             case .failed(let msg):
                 await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
                     model?.bulkActionError = "Delete failed: \(msg)"
                 }
             }
@@ -213,112 +215,60 @@ final class ReadStatusController {
     /// the next full sync re-upserts the rows from Apple's Envelope Index
     /// (which still has them), and the indexer's `pruneMessagesNotIn` pass
     /// only drops rowids that are actually gone from Apple's side.
-    private func applyOptimisticRemoval(messages: [MessageHeader]) {
-        guard !messages.isEmpty else { return }
+    ///
+    /// Awaitable so callers can guarantee the DB delete lands before they
+    /// trigger a follow-up `runIncrementalSync()`.
+    private func applyOptimisticRemoval(messages: [MessageHeader]) async {
+        guard !messages.isEmpty, let db = model.indexDB else { return }
         let removedRowIds = Set(messages.map(\.rowId))
 
-        // Per-thread + per-mailbox tallies for count maintenance.
+        // Thread membership — looked up BEFORE the DB delete (which needs the
+        // rows still present). Bulk removal may span multiple threads.
+        let map = (try? await db.threadIds(forMessages: messages.map(\.rowId))) ?? [:]
         var byThread: [Int: [MessageHeader]] = [:]
-        var perMailboxTotalDelta: [Int: Int] = [:]
-        var perMailboxUnreadDelta: [Int: Int] = [:]
-        var globalUnreadDelta = 0
-
         for m in messages {
-            perMailboxTotalDelta[m.mailboxRowId, default: 0] -= 1
-            if !m.isRead {
-                perMailboxUnreadDelta[m.mailboxRowId, default: 0] -= 1
-                globalUnreadDelta -= 1
-            }
+            if let tid = map[m.rowId] { byThread[tid, default: []].append(m) }
         }
 
-        // Resolve thread ids in the order we have them in messagesInSelectedThread
-        // (we already know thread membership from the open thread, but bulk
-        // removal may span multiple threads). Use a sync DB hop.
-        Task { @MainActor [weak model] in
-            guard let model, let db = model.indexDB else { return }
-            let map = (try? await db.threadIds(forMessages: messages.map(\.rowId))) ?? [:]
-            for m in messages {
-                if let tid = map[m.rowId] { byThread[tid, default: []].append(m) }
-            }
-
-            // DB delete — has to happen AFTER the thread-id lookup above
-            // (which needs the rows still present). The thread-summary
-            // loaders aggregate counts live from `messages`, so the
-            // remaining queries naturally see the post-delete state.
-            do {
-                try await db.deleteMessagesByRowid(messages.map(\.rowId))
-            } catch {
-                Log.db.error("Optimistic DB delete failed for \(messages.count) rowids: \(String(describing: error), privacy: .public)")
-            }
-
-            // 1) messagesInSelectedThread — drop removed rowids.
-            if model.messagesInSelectedThread.contains(where: { removedRowIds.contains($0.rowId) }) {
-                model.messagesInSelectedThread.removeAll { removedRowIds.contains($0.rowId) }
-            }
-
-            // 2) searchResults — drop removed rowids and prune selection.
-            if model.searchResults.contains(where: { removedRowIds.contains($0.rowId) }) {
-                model.searchResults.removeAll { removedRowIds.contains($0.rowId) }
-                model.selectedSearchResultIds = model.selectedSearchResultIds.subtracting(removedRowIds)
-            }
-
-            // 3) threadsForSelectedMailbox — decrement counts; drop empty threads.
-            var newThreads = model.threadsForSelectedMailbox
-            for (tid, group) in byThread {
-                guard let idx = newThreads.firstIndex(where: { $0.threadId == tid }) else { continue }
-                let s = newThreads[idx]
-                let unreadDrop = group.filter { !$0.isRead }.count
-                let newCount = max(0, s.messageCount - group.count)
-                if newCount == 0 {
-                    newThreads.remove(at: idx)
-                } else {
-                    newThreads[idx] = ThreadSummary(
-                        threadId: s.threadId,
-                        latestDateReceived: s.latestDateReceived,
-                        messageCount: newCount,
-                        unreadCount: max(0, s.unreadCount - unreadDrop),
-                        flaggedCount: s.flaggedCount,
-                        latestSubject: s.latestSubject,
-                        latestSenderDisplay: s.latestSenderDisplay,
-                        latestMessageRowId: s.latestMessageRowId,
-                        latestIsOutgoing: s.latestIsOutgoing
-                    )
-                }
-            }
-            model.threadsForSelectedMailbox = newThreads
-            // If the open thread is gone, clear its selection so the reader empties.
-            if let tid = model.selectedThreadId,
-               !newThreads.contains(where: { $0.threadId == tid }) {
-                model.selectedThreadId = nil
-                model.selectedThreadIds.remove(tid)
-                model.messagesInSelectedThread = []
-                model.bodyForSelectedMessage = nil
-                model.selectedMessageId = nil
-            }
-
-            // 4) Mailboxes — decrement counts on each source mailbox.
-            if !perMailboxTotalDelta.isEmpty {
-                var newMailboxes = model.mailboxes
-                for (mid, totalDelta) in perMailboxTotalDelta {
-                    let unreadDelta = perMailboxUnreadDelta[mid] ?? 0
-                    if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
-                        let mb = newMailboxes[idx]
-                        newMailboxes[idx] = Mailbox(
-                            rowId: mb.rowId, accountUUID: mb.accountUUID,
-                            pathComponents: mb.pathComponents,
-                            totalCount: max(0, mb.totalCount + totalDelta),
-                            unreadCount: max(0, mb.unreadCount + unreadDelta),
-                            hidden: mb.hidden, kind: mb.kind
-                        )
-                    }
-                }
-                model.mailboxes = newMailboxes
-            }
-
-            // 5) Global badge.
-            model.allUnreadCount = max(0, model.allUnreadCount + globalUnreadDelta)
-            model.updateDockBadge()
+        do {
+            try await db.deleteMessagesByRowid(messages.map(\.rowId))
+        } catch {
+            Log.db.error("Optimistic DB delete failed for \(messages.count) rowids: \(String(describing: error), privacy: .public)")
         }
+
+        // 1) messagesInSelectedThread — drop removed rowids.
+        if model.messagesInSelectedThread.contains(where: { removedRowIds.contains($0.rowId) }) {
+            model.messagesInSelectedThread.removeAll { removedRowIds.contains($0.rowId) }
+        }
+
+        // 2) searchResults — drop removed rowids and prune selection.
+        if model.searchResults.contains(where: { removedRowIds.contains($0.rowId) }) {
+            model.searchResults.removeAll { removedRowIds.contains($0.rowId) }
+            model.selectedSearchResultIds = model.selectedSearchResultIds.subtracting(removedRowIds)
+        }
+
+        // 3) threadsForSelectedMailbox — decrement counts; drop empty threads.
+        let newThreads = OptimisticUpdate.applyingRemoval(
+            to: model.threadsForSelectedMailbox, removedByThread: byThread
+        )
+        model.threadsForSelectedMailbox = newThreads
+        // If the open thread is gone, clear its selection so the reader empties.
+        if let tid = model.selectedThreadId,
+           !newThreads.contains(where: { $0.threadId == tid }) {
+            model.selectedThreadId = nil
+            model.selectedThreadIds.remove(tid)
+            model.messagesInSelectedThread = []
+            model.bodyForSelectedMessage = nil
+            model.selectedMessageId = nil
+        }
+
+        // 4) Mailboxes — decrement counts on each source mailbox.
+        applyMailboxCountDeltas(OptimisticUpdate.mailboxDeltas(forRemoving: messages))
+
+        // 5) Global counter.
+        model.allUnreadCount = max(
+            0, model.allUnreadCount + OptimisticUpdate.globalUnreadDelta(forRemoving: messages)
+        )
     }
 
     /// Mark every message in every currently-selected thread. Honors the
@@ -347,28 +297,37 @@ final class ReadStatusController {
     /// update closed-thread summaries too, then apply optimistically and
     /// dispatch the AppleScript.
     private func applyAndDispatch(messages: [MessageHeader], isRead: Bool) async {
-        let perThread: [(threadId: Int, messages: [MessageHeader])]
-        if let db = model.indexDB,
-           let map = try? await db.threadIds(forMessages: messages.map(\.rowId)) {
-            var byThread: [Int: [MessageHeader]] = [:]
-            for msg in messages {
-                if let tid = map[msg.rowId] {
-                    byThread[tid, default: []].append(msg)
-                }
-            }
-            perThread = byThread.map { ($0.key, $0.value) }
-        } else {
-            perThread = []
-        }
+        await applyOptimisticReadFlip(messages: messages, isRead: isRead)
+        await dispatchAppleScript(messages: messages, isRead: isRead)
+    }
 
+    /// Group `messages` by thread id (via IndexDB) and apply the optimistic
+    /// read flip. Falls back to a per-message visible-array flip when the DB
+    /// lookup is unavailable, so the reader/search views still update.
+    private func applyOptimisticReadFlip(messages: [MessageHeader], isRead: Bool) async {
+        let perThread = await groupByThread(messages)
         if !perThread.isEmpty {
             applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
         } else {
-            // Fallback when DB lookup failed: at least flip the per-message
-            // state so the search/reader views update.
             applyOptimisticReadFlags(messageRowIds: messages.map(\.rowId), isRead: isRead)
         }
-        await dispatchAppleScript(messages: messages, isRead: isRead)
+    }
+
+    /// Bucket `messages` by their thread id. Returns `[]` when the index is
+    /// unavailable or the lookup fails (callers treat that as "fall back to a
+    /// per-message flip").
+    private func groupByThread(
+        _ messages: [MessageHeader]
+    ) async -> [(threadId: Int, messages: [MessageHeader])] {
+        guard let db = model.indexDB,
+              let map = try? await db.threadIds(forMessages: messages.map(\.rowId)) else {
+            return []
+        }
+        var byThread: [Int: [MessageHeader]] = [:]
+        for msg in messages {
+            if let tid = map[msg.rowId] { byThread[tid, default: []].append(msg) }
+        }
+        return byThread.map { (threadId: $0.key, messages: $0.value) }
     }
 
     /// Build the AppleScript batch and fire it at Mail.app on a detached
@@ -381,12 +340,12 @@ final class ReadStatusController {
         let entries = mailScripterEntries(for: messages)
         guard !entries.isEmpty else { return }
 
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        suppressSync(.beforeDispatch)
 
         Task.detached { [weak model] in
             let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
             await MainActor.run {
-                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
             }
             switch result {
             case .ok:
@@ -438,107 +397,40 @@ final class ReadStatusController {
         perThread: [(threadId: Int, messages: [MessageHeader])],
         isRead: Bool
     ) {
-        let perMessageDelta = isRead ? -1 : 1
-
-        // Update every selected thread's summary.
-        var newThreads = model.threadsForSelectedMailbox
-        for (tid, msgs) in perThread {
-            if let idx = newThreads.firstIndex(where: { $0.threadId == tid }) {
-                let s = newThreads[idx]
-                let delta = msgs.count * perMessageDelta
-                newThreads[idx] = ThreadSummary(
-                    threadId: s.threadId,
-                    latestDateReceived: s.latestDateReceived,
-                    messageCount: s.messageCount,
-                    unreadCount: max(0, s.unreadCount + delta),
-                    flaggedCount: s.flaggedCount,
-                    latestSubject: s.latestSubject,
-                    latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId,
-                    latestIsOutgoing: s.latestIsOutgoing
-                )
-            }
-        }
-        model.threadsForSelectedMailbox = newThreads
-
-        // Aggregate per-mailbox deltas, update sidebar counts.
         let allMessages = perThread.flatMap { $0.messages }
-        var mailboxDeltas: [Int: Int] = [:]
-        for msg in allMessages {
-            mailboxDeltas[msg.mailboxRowId, default: 0] += perMessageDelta
-        }
-        if !mailboxDeltas.isEmpty {
-            var newMailboxes = model.mailboxes
-            for (mid, delta) in mailboxDeltas {
-                if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
-                    let mb = newMailboxes[idx]
-                    newMailboxes[idx] = Mailbox(
-                        rowId: mb.rowId, accountUUID: mb.accountUUID,
-                        pathComponents: mb.pathComponents,
-                        totalCount: mb.totalCount,
-                        unreadCount: max(0, mb.unreadCount + delta),
-                        hidden: mb.hidden, kind: mb.kind
-                    )
-                }
-            }
-            model.mailboxes = newMailboxes
-        }
 
-        // Update messagesInSelectedThread for any flipped message that is
-        // in the open thread (so the reader's per-message dot updates too).
-        let flippedRowIds = Set(allMessages.map(\.rowId))
-        var newMessagesInThread = model.messagesInSelectedThread
-        var anyChangedInThread = false
-        for idx in newMessagesInThread.indices {
-            let m = newMessagesInThread[idx]
-            if flippedRowIds.contains(m.rowId), m.isRead != isRead {
-                newMessagesInThread[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-                anyChangedInThread = true
-            }
-        }
-        if anyChangedInThread { model.messagesInSelectedThread = newMessagesInThread }
+        // Thread summaries — decrement/increment each by its flipped count.
+        let flippedCountByThread = Dictionary(
+            perThread.map { ($0.threadId, $0.messages.count) }, uniquingKeysWith: +
+        )
+        model.threadsForSelectedMailbox = OptimisticUpdate.applyingReadFlip(
+            to: model.threadsForSelectedMailbox,
+            flippedCountByThread: flippedCountByThread,
+            isRead: isRead
+        )
 
-        // Same for searchResults if any of these messages are showing there.
-        var newSearchResults = model.searchResults
-        var anyChangedInSearch = false
-        for idx in newSearchResults.indices {
-            let m = newSearchResults[idx]
-            if flippedRowIds.contains(m.rowId), m.isRead != isRead {
-                newSearchResults[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-                anyChangedInSearch = true
-            }
-        }
-        if anyChangedInSearch { model.searchResults = newSearchResults }
+        // Sidebar mailbox unread counts.
+        applyMailboxUnreadDeltas(
+            OptimisticUpdate.mailboxUnreadDeltas(forFlipping: allMessages, isRead: isRead)
+        )
 
-        // Global counter + dock badge.
-        let totalDelta = allMessages.count * perMessageDelta
+        // Flip the per-message read dot wherever these messages are visible.
+        flipReadInVisibleArrays(rowIds: Set(allMessages.map(\.rowId)), isRead: isRead)
+
+        // Global counter.
+        let totalDelta = allMessages.count * OptimisticUpdate.unreadDelta(isRead: isRead)
         model.allUnreadCount = max(0, model.allUnreadCount + totalDelta)
-        model.updateDockBadge()
 
         // Persist to DB.
         if let db = model.indexDB {
-            let ids = allMessages.map(\.rowId)
-            persistIsRead(rowids: ids, isRead: isRead, db: db)
+            persistIsRead(rowids: allMessages.map(\.rowId), isRead: isRead, db: db)
         }
     }
 
-    /// Per-message fallback when DB lookup failed. Applies *all* changes to
-    /// each array (`searchResults`, `messagesInSelectedThread`, `mailboxes`,
-    /// `threadsForSelectedMailbox`) with a single assignment per array, so
-    /// SwiftUI sees one observable mutation per array. Counters are
-    /// aggregated across the batch.
+    /// Per-message fallback when the thread-id lookup failed. Discovers each
+    /// message's previous read state and mailbox from the visible arrays
+    /// (`messagesInSelectedThread`, `searchResults`) — the only places it can
+    /// see them without the DB — and updates counts from there.
     private func applyOptimisticReadFlags(messageRowIds: [Int], isRead: Bool) {
         guard !messageRowIds.isEmpty else { return }
 
@@ -548,42 +440,26 @@ final class ReadStatusController {
         var unreadCountDelta = 0
         var mailboxDeltas: [Int: Int] = [:]
         var flippedRowIds: [Int] = []
+        let perMessage = OptimisticUpdate.unreadDelta(isRead: isRead)
 
         for rowId in messageRowIds {
             var prevIsRead: Bool? = nil
             var mailboxRowId: Int? = nil
 
             if let idx = newMessagesInThread.firstIndex(where: { $0.rowId == rowId }) {
-                let m = newMessagesInThread[idx]
-                prevIsRead = m.isRead
-                mailboxRowId = m.mailboxRowId
-                newMessagesInThread[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
+                prevIsRead = newMessagesInThread[idx].isRead
+                mailboxRowId = newMessagesInThread[idx].mailboxRowId
+                newMessagesInThread[idx] = newMessagesInThread[idx].withIsRead(isRead)
             }
             if let idx = newSearchResults.firstIndex(where: { $0.rowId == rowId }) {
-                let m = newSearchResults[idx]
-                if prevIsRead == nil { prevIsRead = m.isRead }
-                if mailboxRowId == nil { mailboxRowId = m.mailboxRowId }
-                newSearchResults[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
+                if prevIsRead == nil { prevIsRead = newSearchResults[idx].isRead }
+                if mailboxRowId == nil { mailboxRowId = newSearchResults[idx].mailboxRowId }
+                newSearchResults[idx] = newSearchResults[idx].withIsRead(isRead)
             }
 
             if let prev = prevIsRead, prev != isRead {
-                let d = isRead ? -1 : 1
-                unreadCountDelta += d
-                if let mid = mailboxRowId {
-                    mailboxDeltas[mid, default: 0] += d
-                }
+                unreadCountDelta += perMessage
+                if let mid = mailboxRowId { mailboxDeltas[mid, default: 0] += perMessage }
                 flippedRowIds.append(rowId)
             }
         }
@@ -591,22 +467,7 @@ final class ReadStatusController {
         model.searchResults = newSearchResults
         model.messagesInSelectedThread = newMessagesInThread
 
-        if !mailboxDeltas.isEmpty {
-            var newMailboxes = model.mailboxes
-            for (mid, delta) in mailboxDeltas {
-                if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
-                    let mb = newMailboxes[idx]
-                    newMailboxes[idx] = Mailbox(
-                        rowId: mb.rowId, accountUUID: mb.accountUUID,
-                        pathComponents: mb.pathComponents,
-                        totalCount: mb.totalCount,
-                        unreadCount: max(0, mb.unreadCount + delta),
-                        hidden: mb.hidden, kind: mb.kind
-                    )
-                }
-            }
-            model.mailboxes = newMailboxes
-        }
+        applyMailboxUnreadDeltas(mailboxDeltas)
 
         // Open thread's summary — count how many flipped messages belong
         // to it (may differ when bulk-marking from search results that
@@ -618,27 +479,55 @@ final class ReadStatusController {
                 newMessagesInThread.contains(where: { $0.rowId == id })
             }.count
             if inThreadCount > 0 {
-                let threadDelta = inThreadCount * (isRead ? -1 : 1)
                 let s = model.threadsForSelectedMailbox[summaryIdx]
-                model.threadsForSelectedMailbox[summaryIdx] = ThreadSummary(
-                    threadId: s.threadId,
-                    latestDateReceived: s.latestDateReceived,
-                    messageCount: s.messageCount,
-                    unreadCount: max(0, s.unreadCount + threadDelta),
-                    flaggedCount: s.flaggedCount,
-                    latestSubject: s.latestSubject,
-                    latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId,
-                    latestIsOutgoing: s.latestIsOutgoing
-                )
+                model.threadsForSelectedMailbox[summaryIdx] =
+                    s.with(unreadCount: max(0, s.unreadCount + inThreadCount * perMessage))
             }
         }
 
         model.allUnreadCount = max(0, model.allUnreadCount + unreadCountDelta)
-        model.updateDockBadge()
 
         if let db = model.indexDB, !flippedRowIds.isEmpty {
             persistIsRead(rowids: flippedRowIds, isRead: isRead, db: db)
+        }
+    }
+
+    // MARK: — Shared model mutations
+
+    /// Apply per-mailbox unread deltas to the sidebar, in one assignment.
+    private func applyMailboxUnreadDeltas(_ deltas: [Int: Int]) {
+        guard !deltas.isEmpty else { return }
+        model.mailboxes = model.mailboxes.map { mb in
+            guard let delta = deltas[mb.rowId], delta != 0 else { return mb }
+            return mb.with(unreadCount: max(0, mb.unreadCount + delta))
+        }
+    }
+
+    /// Apply per-mailbox total+unread deltas (used by removal), in one
+    /// assignment.
+    private func applyMailboxCountDeltas(_ deltas: [Int: OptimisticUpdate.CountDelta]) {
+        guard !deltas.isEmpty else { return }
+        model.mailboxes = model.mailboxes.map { mb in
+            guard let d = deltas[mb.rowId] else { return mb }
+            return mb.with(
+                totalCount: max(0, mb.totalCount + d.total),
+                unreadCount: max(0, mb.unreadCount + d.unread)
+            )
+        }
+    }
+
+    /// Flip the read flag on `rowIds` wherever they appear in the open thread
+    /// or the search results, reassigning each array at most once.
+    private func flipReadInVisibleArrays(rowIds: Set<Int>, isRead: Bool) {
+        if model.messagesInSelectedThread.contains(where: { rowIds.contains($0.rowId) && $0.isRead != isRead }) {
+            model.messagesInSelectedThread = model.messagesInSelectedThread.map {
+                rowIds.contains($0.rowId) && $0.isRead != isRead ? $0.withIsRead(isRead) : $0
+            }
+        }
+        if model.searchResults.contains(where: { rowIds.contains($0.rowId) && $0.isRead != isRead }) {
+            model.searchResults = model.searchResults.map {
+                rowIds.contains($0.rowId) && $0.isRead != isRead ? $0.withIsRead(isRead) : $0
+            }
         }
     }
 
@@ -647,14 +536,14 @@ final class ReadStatusController {
     /// flip would silently revert on the next sync, leaving the user with
     /// no idea what happened.
     private func persistIsRead(rowids: [Int], isRead: Bool, db: IndexDB) {
+        // Inherits MainActor isolation from this @MainActor method, so the
+        // catch block runs back on the main actor without an explicit hop.
         Task { [weak model] in
             do {
                 try await db.setIsReadBatch(rowids: rowids, isRead: isRead)
             } catch {
                 Log.db.error("setIsReadBatch failed for \(rowids.count) rows: \(String(describing: error), privacy: .public)")
-                await MainActor.run {
-                    model?.bulkActionError = "Couldn't update read status in the local index — your change may not stick after the next sync. (\(error.localizedDescription))"
-                }
+                model?.bulkActionError = "Couldn't update read status in the local index — your change may not stick after the next sync. (\(error.localizedDescription))"
             }
         }
     }

@@ -6,9 +6,15 @@ struct MailAccount: Identifiable, Hashable {
     let displayName: String
     let emailAddress: String?
     var id: String { uuid }
-    var rootURL: URL {
-        MailStoreEnumerator.currentMailVersionDirectory()!.appendingPathComponent(uuid)
-    }
+}
+
+/// Recipient role, mirroring Apple's `recipients.type` column (and FMail's
+/// `IndexedRecipient.kind`). Avoids the magic 0/1/2/3 literals in SQL.
+enum RecipientKind: Int {
+    case to = 0
+    case cc = 1
+    case bcc = 2
+    case from = 3
 }
 
 /// A mailbox (= folder, in old-Apple-Mail terms). Each mailbox lives under one
@@ -25,6 +31,16 @@ struct Mailbox: Identifiable, Hashable {
     var id: Int { rowId }
 
     var displayName: String { pathComponents.last ?? "(unnamed)" }
+
+    /// Copy with adjusted counts (the only fields optimistic flips touch).
+    func with(totalCount: Int? = nil, unreadCount: Int? = nil) -> Mailbox {
+        Mailbox(
+            rowId: rowId, accountUUID: accountUUID, pathComponents: pathComponents,
+            totalCount: totalCount ?? self.totalCount,
+            unreadCount: unreadCount ?? self.unreadCount,
+            hidden: hidden, kind: kind
+        )
+    }
 
     /// Filesystem path to the .mbox directory tree for this mailbox.
     func diskURL(under accountRoot: URL) -> URL {
@@ -77,6 +93,17 @@ struct MessageHeader: Identifiable, Hashable {
     let imapUID: Int?             // Apple Mail's per-mailbox IMAP UID; lets
                                   // AppleScript do O(1) `whose id is N` lookups
     var id: Int { rowId }
+
+    /// Copy with a flipped read flag.
+    func withIsRead(_ isRead: Bool) -> MessageHeader {
+        MessageHeader(
+            rowId: rowId, mailboxRowId: mailboxRowId, subject: subject,
+            senderAddress: senderAddress, senderDisplay: senderDisplay,
+            dateSent: dateSent, dateReceived: dateReceived,
+            isRead: isRead, isFlagged: isFlagged,
+            rfcMessageId: rfcMessageId, imapUID: imapUID
+        )
+    }
 }
 
 /// One attachment extracted from an `.emlx`. `data` holds the decoded bytes

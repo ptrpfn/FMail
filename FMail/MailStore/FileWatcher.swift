@@ -87,11 +87,22 @@ final class FileWatcher: @unchecked Sendable {
     }
 
     func stop() {
-        guard let s = stream else { return }
-        FSEventStreamStop(s)
-        FSEventStreamInvalidate(s)
-        FSEventStreamRelease(s)
-        self.stream = nil
+        // Tear down on the stream's own dispatch queue so we can't race a
+        // callback in flight there. The callback resolves `self` via
+        // `passUnretained`, so a callback running during dealloc would be a
+        // use-after-free; serializing on `queue` (and cancelling any pending
+        // coalescer) closes that window. `queue.sync` is safe because neither
+        // caller (SyncCoordinator on the main actor, or deinit) runs on
+        // `queue`.
+        queue.sync {
+            coalescer?.cancel()
+            coalescer = nil
+            guard let s = stream else { return }
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+            stream = nil
+        }
     }
 
     private func handle(paths: [String], lastEventId: FSEventStreamEventId) {

@@ -24,7 +24,7 @@ struct IndexedMessage {
 
 struct IndexedRecipient {
     let messageRowId: Int
-    let kind: Int       // 0=to, 1=cc, 2=bcc, 3=from
+    let kind: Int       // RecipientKind raw value (0=to, 1=cc, 2=bcc, 3=from)
     let position: Int
     let address: String
     let display: String?
@@ -66,11 +66,19 @@ struct ThreadSummary: Identifiable, Hashable {
     let latestMessageRowId: Int
     let latestIsOutgoing: Bool
     var id: Int { threadId }
-}
 
-/// Per-contact preferences mirroring the `contact_prefs` table.
-struct ContactPrefs: Sendable, Equatable {
-    let contactId: String
-    let preferredAddress: String?
-    let blockedAddresses: Set<String>
+    /// Copy with adjusted counts (the only fields optimistic flips touch).
+    func with(messageCount: Int? = nil, unreadCount: Int? = nil) -> ThreadSummary {
+        ThreadSummary(
+            threadId: threadId,
+            latestDateReceived: latestDateReceived,
+            messageCount: messageCount ?? self.messageCount,
+            unreadCount: unreadCount ?? self.unreadCount,
+            flaggedCount: flaggedCount,
+            latestSubject: latestSubject,
+            latestSenderDisplay: latestSenderDisplay,
+            latestMessageRowId: latestMessageRowId,
+            latestIsOutgoing: latestIsOutgoing
+        )
+    }
 }

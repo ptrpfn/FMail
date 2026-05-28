@@ -224,14 +224,9 @@ final class OAuthStore {
 
     // MARK: — Helpers
 
-    /// 32-byte random buffer → base64url-encoded (~43 chars), no padding.
+    /// Random base64url token (~43 chars for 32 bytes, no padding).
     private func randomToken(byteCount: Int) -> String {
-        var bytes = [UInt8](repeating: 0, count: byteCount)
-        let rc = SecRandomCopyBytes(kSecRandomDefault, byteCount, &bytes)
-        if rc != errSecSuccess {
-            for i in 0..<byteCount { bytes[i] = UInt8.random(in: 0...255) }
-        }
-        return OAuthPKCE.base64URLEncode(Data(bytes))
+        OAuthPKCE.randomToken(byteCount: byteCount)
     }
 }
 

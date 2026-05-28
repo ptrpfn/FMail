@@ -7,6 +7,8 @@ import Foundation
 /// progress fields, indexDB connection).
 @MainActor
 final class SyncCoordinator {
+    // `weak` (not `unowned`): this object owns periodic + detached tasks that
+    // can fire while the model is tearing down, so each use guards `model`.
     private weak var model: MailModel?
     private let indexer: Indexer
     private let bodyIndexer: BodyIndexer
@@ -89,7 +91,6 @@ final class SyncCoordinator {
                 if let count = try? await model.indexDB?.countAllUnreadExcludingDrafts() {
                     model.allUnreadCount = count
                 }
-                model.updateDockBadge()
             }
         } catch {
             Log.sync.error("read-flag reconcile failed: \(String(describing: error), privacy: .public)")
@@ -113,6 +114,13 @@ final class SyncCoordinator {
         // bulk transactions over the same SQLite connection.
         await bodyIndexer.cancel()
         bodyIndexerTask = nil
+
+        // A sync runs because disk changed: new `.emlx` files arrived and
+        // `.partial.emlx` placeholders may have been replaced by full bodies.
+        // BodyLoader caches a per-mailbox rowid→URL map, so drop it here or it
+        // would keep returning nil for new messages (and the partial URL for
+        // upgraded ones) until the next launch.
+        await model.bodyLoader?.invalidateAll()
 
         do {
             try await indexer.runFullSync { [weak model] snapshot in

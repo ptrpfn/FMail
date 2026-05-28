@@ -4,9 +4,8 @@ import SQLite3
 /// Read helpers used by the MCP server. Kept in their own extension so the
 /// MCP plumbing stays isolated from the rest of the index API.
 ///
-/// The `messages` table column list shapes match those used by `search()`
-/// (`IndexDB.swift:506`) so that callers can mix results from `search` and
-/// `loadMessage` interchangeably.
+/// `loadMessage` shares `IndexDB.messageHeaderSelectList` with `search()`, so
+/// callers can mix results from `search` and `loadMessage` interchangeably.
 extension IndexDB {
 
     /// Single-message lookup by `apple_rowid`. Returns nil if the message
@@ -14,11 +13,7 @@ extension IndexDB {
     /// call).
     func loadMessage(rowid: Int) throws -> MessageHeader? {
         let sql = """
-        SELECT m.apple_rowid, m.mailbox_rowid,
-               COALESCE(m.subject_prefix, '') || m.subject,
-               m.sender_address, m.sender_display,
-               m.date_sent, m.date_received,
-               m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
+        SELECT \(Self.messageHeaderSelectList)
         FROM messages m
         WHERE m.apple_rowid = ?
         """
@@ -27,24 +22,7 @@ extension IndexDB {
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(rowid))
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        let mboxId = Int(sqlite3_column_int64(stmt, 1))
-        let subject = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
-        let sa = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-        let sd = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? ""
-        let ds = sqlite3_column_int64(stmt, 5)
-        let dr = sqlite3_column_int64(stmt, 6)
-        let read = sqlite3_column_int(stmt, 7) != 0
-        let flagged = sqlite3_column_int(stmt, 8) != 0
-        let rfcId = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
-        let uidVal = sqlite3_column_int64(stmt, 10)
-        let uid: Int? = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : Int(uidVal)
-        return MessageHeader(
-            rowId: rowid, mailboxRowId: mboxId, subject: subject,
-            senderAddress: sa, senderDisplay: sd,
-            dateSent: ds > 0 ? Date(timeIntervalSince1970: TimeInterval(ds)) : nil,
-            dateReceived: dr > 0 ? Date(timeIntervalSince1970: TimeInterval(dr)) : nil,
-            isRead: read, isFlagged: flagged, rfcMessageId: rfcId, imapUID: uid
-        )
+        return Self.decodeMessageHeader(stmt)
     }
 
     /// Single-mailbox lookup by `apple_rowid`. Returns nil if the mailbox is
@@ -79,7 +57,7 @@ extension IndexDB {
     }
 
     /// All recipients of `messageRowId`, ordered by (kind, position).
-    /// `kind`: 0=to, 1=cc, 2=bcc, 3=from (informational, rarely used).
+    /// `kind`: RecipientKind raw value (0=to, 1=cc, 2=bcc, 3=from).
     func loadRecipients(messageRowId: Int) throws -> [MCPRecipient] {
         let sql = """
         SELECT kind, address, COALESCE(display, '')
@@ -107,12 +85,10 @@ extension IndexDB {
     func enrichForMCP(rowids: [Int]) throws -> [Int: MCPMessageEnrichment] {
         guard !rowids.isEmpty else { return [:] }
         let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
-        // Effective thread id: real thread_id when set, apple_rowid as a
-        // synthetic singleton id otherwise. Matches IndexDB.effectiveThreadIdExpr.
         let sql = """
         SELECT m.apple_rowid,
                COALESCE(mb.path, '') AS mailbox_path,
-               CASE WHEN m.thread_id = 0 THEN m.apple_rowid ELSE m.thread_id END AS thread_id,
+               \(Self.effectiveThreadIdExpr) AS thread_id,
                m.has_attachment,
                m.body_indexed,
                a.email_address
@@ -209,20 +185,12 @@ extension IndexDB {
         let sql = """
         WITH effective AS (
             SELECT m.apple_rowid,
-                   CASE WHEN m.thread_id = 0 THEN m.apple_rowid ELSE m.thread_id END AS tid,
+                   \(Self.effectiveThreadIdExpr) AS tid,
                    m.date_received,
                    COALESCE(m.subject_prefix, '') || COALESCE(m.subject, '') AS subj,
                    COALESCE(m.sender_address, '') AS sender_address
             FROM messages m
-            WHERE m.mailbox_rowid NOT IN (
-                  SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk')
-              )
-              AND m.apple_rowid NOT IN (
-                  SELECT message_rowid FROM message_labels
-                  WHERE mailbox_rowid IN (
-                      SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk')
-                  )
-              )
+            WHERE \(Self.systemMailboxExcludeFilter)
         ),
         thread_latest AS (
             SELECT tid, MAX(date_received) AS latest_date FROM effective GROUP BY tid
@@ -238,7 +206,7 @@ extension IndexDB {
                COALESCE((
                    SELECT GROUP_CONCAT(LOWER(r.address), ',')
                    FROM recipients r
-                   WHERE r.message_rowid = c.apple_rowid AND r.kind = 0
+                   WHERE r.message_rowid = c.apple_rowid AND r.kind = \(RecipientKind.to.rawValue)
                ), '') AS to_addresses
         FROM candidates c
         ORDER BY c.date_received DESC
@@ -294,7 +262,7 @@ extension IndexDB {
 /// Wire types passed back from the MCP-only IndexDB read helpers.
 
 struct MCPRecipient: Sendable, Hashable {
-    let kind: Int  // 0=to, 1=cc, 2=bcc, 3=from
+    let kind: Int  // RecipientKind raw value (0=to, 1=cc, 2=bcc, 3=from)
     let address: String
     let display: String?
 }

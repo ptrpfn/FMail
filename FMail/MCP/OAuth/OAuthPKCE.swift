@@ -22,7 +22,7 @@ enum OAuthPKCE {
         let data = Data(verifier.utf8)
         let digest = SHA256.hash(data: data)
         let computed = base64URLEncode(Data(digest))
-        return constantTimeEqual(computed, challenge)
+        return MCPHelpers.constantTimeEqual(computed, challenge)
     }
 
     /// `+` → `-`, `/` → `_`, drop `=` padding. Standard PKCE encoding.
@@ -33,14 +33,16 @@ enum OAuthPKCE {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    /// Constant-time string compare so a leaked timing oracle can't help
-    /// recover the challenge bit-by-bit.
-    private static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
-        let aBytes = Array(a.utf8)
-        let bBytes = Array(b.utf8)
-        if aBytes.count != bBytes.count { return false }
-        var diff: UInt8 = 0
-        for i in 0..<aBytes.count { diff |= aBytes[i] ^ bBytes[i] }
-        return diff == 0
+    /// Cryptographically-random base64url token (`byteCount` raw bytes).
+    /// Shared by `OAuthStore` (codes + sessions + client ids) and
+    /// `MCPSettings.generateAuthToken`.
+    static func randomToken(byteCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        let rc = SecRandomCopyBytes(kSecRandomDefault, byteCount, &bytes)
+        if rc != errSecSuccess {
+            // SecRandom failure is exceptional; fall back to arc4random.
+            for i in 0..<byteCount { bytes[i] = UInt8.random(in: 0...255) }
+        }
+        return base64URLEncode(Data(bytes))
     }
 }

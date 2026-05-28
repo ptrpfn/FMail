@@ -95,12 +95,9 @@ actor BodyLoader {
         }
     }
 
-    /// Drop the cached file map for one mailbox — call when we know its
-    /// contents on disk have changed.
-    func invalidate(mailboxRowId: Int) {
-        emlxIndexByMailbox.removeValue(forKey: mailboxRowId)
-    }
-
+    /// Drop every cached `rowid → URL` map. Called after a sync, since new
+    /// `.emlx` files on disk (and `.partial.emlx` upgraded to full bodies)
+    /// won't be visible through a stale cache.
     func invalidateAll() {
         emlxIndexByMailbox.removeAll()
         mboxDirCache.removeAll()

@@ -55,7 +55,7 @@ final class Indexer: Sendable {
 
         let acctUUIDs = Array(Set(mailboxes.map(\.accountUUID))).sorted()
         let accounts: [(uuid: String, displayName: String, email: String?)] = acctUUIDs.map { uuid in
-            let email = (try? env.likelyEmailAddress(forAccountUUID: uuid, mailboxes: mailboxes)) ?? nil
+            let email = env.likelyEmailAddress(forAccountUUID: uuid, mailboxes: mailboxes)
             let display = email ?? "Account \(uuid.prefix(8))"
             return (uuid, display, email)
         }

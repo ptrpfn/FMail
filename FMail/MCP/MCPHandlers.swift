@@ -244,7 +244,7 @@ enum MCPHandlers {
         return try JSONValue.encoding(one)
     }
 
-    // (find_unanswered_threads lives in MCPHandlers+A3.swift.)
+    // (find_unanswered_threads lives in MCPHandlers+Unanswered.swift.)
 
     // MARK: — Internals
 
@@ -290,9 +290,9 @@ enum MCPHandlers {
 
         for m in messages {
             let recipients = (try? await context.indexDB.loadRecipients(messageRowId: m.rowId)) ?? []
-            let to = recipients.filter { $0.kind == 0 }.map(\.address)
-            let cc = recipients.filter { $0.kind == 1 }.map(\.address)
-            let bcc = recipients.filter { $0.kind == 2 }.map(\.address)
+            let to = recipients.filter { $0.kind == RecipientKind.to.rawValue }.map(\.address)
+            let cc = recipients.filter { $0.kind == RecipientKind.cc.rawValue }.map(\.address)
+            let bcc = recipients.filter { $0.kind == RecipientKind.bcc.rawValue }.map(\.address)
 
             var plainText = ""
             var htmlPresent = false
@@ -310,31 +310,12 @@ enum MCPHandlers {
                 }
                 if let mb,
                    let body = try? await context.bodyLoader.loadBody(messageRowId: m.rowId, mailbox: mb) {
-                    // Apply the format pass first; per-message and total
-                    // budgets work against the post-clean text length.
-                    let processed: String
-                    switch bodyFormat {
-                    case .clean: processed = BodyCleaner.clean(body.displayText)
-                    case .plain, .raw: processed = body.displayText
-                    }
-                    fullChars = processed.count
-                    htmlPresent = body.html != nil && !(body.html ?? "").isEmpty
-                    if maxBodyChars == 0 {
-                        plainText = ""
-                        truncated = processed.count > 0
-                    } else if processed.count > maxBodyChars {
-                        plainText = String(processed.prefix(maxBodyChars))
-                        truncated = true
-                    } else {
-                        plainText = processed
-                    }
-                    attachments = body.attachments.map { a in
-                        AttachmentRef(
-                            name: a.name,
-                            content_type: a.contentType,
-                            byte_count: a.data.count
-                        )
-                    }
+                    let processed = Self.processBody(body, format: bodyFormat, maxBodyChars: maxBodyChars)
+                    plainText = processed.text
+                    truncated = processed.truncated
+                    fullChars = processed.fullChars
+                    htmlPresent = processed.htmlPresent
+                    attachments = processed.attachments
                 }
                 // body == nil happens when Mail.app fetched only the header.
                 // We don't trigger an AppleScript fetch here — that's a 5–10s
@@ -368,6 +349,49 @@ enum MCPHandlers {
             ))
         }
         return out
+    }
+
+    /// Result of cleaning + truncating one loaded body for an `EmailFull`.
+    private struct ProcessedBody {
+        let text: String
+        let truncated: Bool
+        let fullChars: Int
+        let htmlPresent: Bool
+        let attachments: [AttachmentRef]
+    }
+
+    /// Apply the `body_format` pass, then truncate to `maxBodyChars`
+    /// (0 = headers/attachments only). The cleaned length is what budgets
+    /// work against, so `fullChars` is the post-clean character count.
+    private static func processBody(
+        _ body: MessageBody, format: BodyFormat, maxBodyChars: Int
+    ) -> ProcessedBody {
+        let processed: String
+        switch format {
+        case .clean: processed = BodyCleaner.clean(body.displayText)
+        case .plain, .raw: processed = body.displayText
+        }
+        let text: String
+        let truncated: Bool
+        if maxBodyChars == 0 {
+            text = ""
+            truncated = processed.count > 0
+        } else if processed.count > maxBodyChars {
+            text = String(processed.prefix(maxBodyChars))
+            truncated = true
+        } else {
+            text = processed
+            truncated = false
+        }
+        return ProcessedBody(
+            text: text,
+            truncated: truncated,
+            fullChars: processed.count,
+            htmlPresent: body.html != nil && !(body.html ?? "").isEmpty,
+            attachments: body.attachments.map {
+                AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count)
+            }
+        )
     }
 }
 

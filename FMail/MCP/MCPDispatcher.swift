@@ -2,8 +2,8 @@ import Foundation
 
 /// Tool registry + JSON-RPC method dispatcher for the MCP server.
 /// Stateless apart from the registered tools — connection handling lives in
-/// `MCPServer`. Phase A1 starts with an empty registry; Phase A2/A3 register
-/// the 6 FMail tools through `MCPTools`.
+/// `MCPServer`. The registry starts empty; `MCPTools.registerReadTools`
+/// populates it once per server start.
 actor MCPDispatcher {
     private var tools: [String: MCPTool] = [:]
 

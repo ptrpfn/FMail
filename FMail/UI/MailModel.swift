@@ -91,6 +91,10 @@ final class MailModel {
     private var willTerminateObserverRegistered = false
     private var searchTask: Task<Void, Never>?
 
+    /// Cap on rows pulled for the thread list and search results — the UI is
+    /// a scannable list, not an exhaustive export.
+    private static let listLoadLimit = 600
+
     var selectedMailbox: Mailbox? {
         guard case .mailbox(let id) = selection else { return nil }
         return mailboxes.first { $0.rowId == id }
@@ -209,6 +213,12 @@ final class MailModel {
             return
         }
 
+        // Already running on the requested port — nothing to do. Avoids a
+        // redundant stop/re-register/start cycle on every menu re-render.
+        if mcpServer != nil, case .running(let p) = mcpServerStatus, p == UInt16(desiredPort) {
+            return
+        }
+
         guard let indexDB = self.indexDB, let bodyLoader = self.bodyLoader else {
             // boot() hasn't reached `.ready` yet — nothing to register against.
             // boot() calls applyMCPSettings() again at the end.
@@ -270,20 +280,18 @@ final class MailModel {
             return
         }
 
+        // Inherits MainActor isolation from this @MainActor method, so the
+        // result handling runs on the main actor without an explicit hop.
         searchTask = Task { [weak self] in
             do {
-                let rows = try await db.search(compiled, limit: 600)
+                let rows = try await db.search(compiled, limit: Self.listLoadLimit)
                 if Task.isCancelled { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    self.searchResults = rows
-                    self.isSearching = false
-                }
+                guard let self else { return }
+                self.searchResults = rows
+                self.isSearching = false
             } catch {
-                await MainActor.run { [weak self] in
-                    self?.searchError = String(describing: error)
-                    self?.isSearching = false
-                }
+                self?.searchError = String(describing: error)
+                self?.isSearching = false
             }
         }
     }
@@ -308,7 +316,6 @@ final class MailModel {
             // inbox cleared itself.
             Log.db.error("countAllUnreadExcludingDrafts failed: \(String(describing: error), privacy: .public)")
         }
-        updateDockBadge()
 
         // Refresh threads if the current scope still resolves.
         switch selection {
@@ -327,24 +334,6 @@ final class MailModel {
             updateSearch(searchQuery)
         }
     }
-
-    /// Pushes `allUnreadCount` to the Dock tile (a no-op in the menu-bar
-    /// accessory build, but harmless). Internal so ReadStatusController can
-    /// call it after optimistic flips.
-    func updateDockBadge() {
-        let cutoff = Self.dockBadgeMaxDisplay
-        let label: String
-        if allUnreadCount <= 0 {
-            label = ""
-        } else if allUnreadCount > cutoff {
-            label = "\(cutoff)+"
-        } else {
-            label = "\(allUnreadCount)"
-        }
-        NSApplication.shared.dockTile.badgeLabel = label.isEmpty ? nil : label
-    }
-
-    private static let dockBadgeMaxDisplay = 999
 
     func selectAllMailboxes() {
         select(.allMailboxes)
@@ -381,9 +370,9 @@ final class MailModel {
             let threads: [ThreadSummary]
             switch scope {
             case .allMailboxes:
-                threads = try await db.loadAllThreadSummaries(limit: 600)
+                threads = try await db.loadAllThreadSummaries(limit: Self.listLoadLimit)
             case .mailbox(let id):
-                threads = try await db.loadThreadSummaries(mailboxRowId: id, limit: 600)
+                threads = try await db.loadThreadSummaries(mailboxRowId: id, limit: Self.listLoadLimit)
             case .none:
                 isLoadingThreads = false
                 return

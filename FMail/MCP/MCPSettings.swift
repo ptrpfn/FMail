@@ -1,8 +1,13 @@
 import Foundation
 
 /// User-facing toggles for the MCP server. Backed by `UserDefaults.standard`.
-/// Off by default — the server reads every email so the user has to opt in
-/// explicitly.
+///
+/// `enabled` defaults to **on**: the server binds to `127.0.0.1` only and,
+/// with no auth token configured, serves loopback requests anonymously (any
+/// local process running as the user can read the index). This is an
+/// intentional choice for a single-user local tool — see `enabled` and
+/// `MCPServer.denyIfMissingAuth`. Exposing it via a tunnel additionally
+/// requires an auth token (the server fails closed otherwise).
 enum MCPSettings {
     static let enabledKey = "mcp_enabled"
     static let portKey = "mcp_port"
@@ -76,16 +81,6 @@ enum MCPSettings {
     /// Generate a new auth token: 32 random bytes, base64url-encoded
     /// (URL-safe alphabet, no padding). ~43 chars long.
     static func generateAuthToken() -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let rc = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        if rc != errSecSuccess {
-            // Fall back to arc4random; SecRandom failure is exceptional.
-            for i in 0..<bytes.count { bytes[i] = UInt8.random(in: 0...255) }
-        }
-        let standard = Data(bytes).base64EncodedString()
-        return standard
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        OAuthPKCE.randomToken(byteCount: 32)
     }
 }

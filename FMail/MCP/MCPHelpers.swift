@@ -9,6 +9,18 @@ enum MCPHelpers {
         Swift.max(lo, Swift.min(hi, v))
     }
 
+    /// Constant-time string compare — keeps a timing oracle from leaking a
+    /// secret (bearer token, PKCE challenge) byte by byte. Compares the UTF-8
+    /// bytes; differing lengths short-circuit (length isn't secret here).
+    static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        if aBytes.count != bBytes.count { return false }
+        var diff: UInt8 = 0
+        for i in 0..<aBytes.count { diff |= aBytes[i] ^ bBytes[i] }
+        return diff == 0
+    }
+
     /// Parse YYYY, YYYY-MM, or YYYY-MM-DD as a Date at start-of-period UTC.
     /// Each present segment must be numeric — `"2024-foo"` returns nil
     /// rather than silently degrading to January 1st. Returns nil on any

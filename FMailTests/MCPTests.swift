@@ -105,7 +105,9 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(json["jsonrpc"] as? String, "2.0")
         let serverInfo = ((json["result"] as? [String: Any])?["serverInfo"]) as? [String: Any]
         XCTAssertEqual(serverInfo?["name"] as? String, "fmail")
-        XCTAssertEqual(serverInfo?["version"] as? String, "0.1.0")
+        // serverVersion is read from the bundle (CFBundleShortVersionString),
+        // so assert against the source of truth rather than a literal.
+        XCTAssertEqual(serverInfo?["version"] as? String, MCPProtocol.serverVersion)
     }
 
     func testDispatcherToolsListEmptyWhenNoToolsRegistered() async throws {

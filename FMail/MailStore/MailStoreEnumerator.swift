@@ -5,10 +5,12 @@ import Foundation
 enum MailStoreEnumerator {
     static let mailRoot = URL(fileURLWithPath: ("~/Library/Mail" as NSString).expandingTildeInPath)
 
-    /// Returns `~/Library/Mail/V<N>/` for the highest N present, or nil.
-    static func currentMailVersionDirectory() -> URL? {
+    /// Returns `<root>/V<N>/` for the highest N present, or nil. `root`
+    /// defaults to `~/Library/Mail`; it's injectable so the version-selection
+    /// logic can be unit tested against a temp directory.
+    static func currentMailVersionDirectory(in root: URL = mailRoot) -> URL? {
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: mailRoot,
+            at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {

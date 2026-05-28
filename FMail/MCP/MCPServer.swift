@@ -164,24 +164,26 @@ actor MCPServer {
         if method == "GET" && path == "/.well-known/oauth-protected-resource" {
             return OAuthHandlers.protectedResource(issuer: issuerOrigin(for: request))
         }
+        // OAuth handlers are `@MainActor`; calling them from this actor hops
+        // to the main actor automatically (no explicit `MainActor.run`).
         if method == "POST" && path == "/register" {
-            return await MainActor.run { OAuthHandlers.register(body: request.body) }
+            return await OAuthHandlers.register(body: request.body)
         }
         if method == "GET" && path == "/authorize" {
             let query = FormParser.parseQuery(request.query)
-            return await MainActor.run { OAuthHandlers.authorizePage(query: query) }
+            return await OAuthHandlers.authorizePage(query: query)
         }
         if method == "POST" && path == "/authorize/approve" {
             let form = FormParser.parse(request.body)
-            return await MainActor.run { OAuthHandlers.authorizeApprove(form: form) }
+            return await OAuthHandlers.authorizeApprove(form: form)
         }
         if method == "POST" && path == "/authorize/deny" {
             let form = FormParser.parse(request.body)
-            return await MainActor.run { OAuthHandlers.authorizeDeny(form: form) }
+            return await OAuthHandlers.authorizeDeny(form: form)
         }
         if method == "POST" && path == "/token" {
             let form = FormParser.parse(request.body)
-            return await MainActor.run { OAuthHandlers.token(form: form) }
+            return await OAuthHandlers.token(form: form)
         }
 
         // — MCP probe / RPC.
@@ -213,7 +215,7 @@ actor MCPServer {
         // completed the /authorize → /token flow). When both stores are
         // empty, the server runs unauthenticated for local loopback.
         let issuer = issuerOrigin(for: request)
-        if let denial = await MainActor.run(body: { denyIfMissingAuth(request, issuer: issuer) }) {
+        if let denial = await denyIfMissingAuth(request, issuer: issuer) {
             return denial
         }
 
@@ -248,7 +250,7 @@ actor MCPServer {
         if !hasStaticToken && !hasSessions {
             if tunnelConfigured {
                 Log.mcp.error("MCP rejected request: tunnel configured but no auth token / OAuth sessions — refusing to serve unauthenticated requests")
-                return unauthorizedResponse(issuer: issuer, reason: "tunnel-configured-no-auth")
+                return unauthorizedResponse(issuer: issuer)
             }
             // No auth configured AND no tunnel → loopback-only legacy
             // behaviour; the listener is bound to 127.0.0.1 only.
@@ -257,24 +259,24 @@ actor MCPServer {
         // Accept static token OR any active OAuth session token. The static
         // token is what the local Claude Code route uses (set it in the MCP
         // config's `headers` Authorization to skip OAuth entirely).
-        if hasStaticToken, constantTimeEqual(presented, staticToken) { return nil }
+        if hasStaticToken, MCPHelpers.constantTimeEqual(presented, staticToken) { return nil }
         if !presented.isEmpty, OAuthStore.shared.tokenIsValid(presented) { return nil }
 
         Log.mcp.info("MCP rejected request: missing/invalid bearer token")
-        return unauthorizedResponse(issuer: issuer, reason: "missing-or-invalid-token")
+        return unauthorizedResponse(issuer: issuer)
     }
 
     /// Build the standard 401 response with the OAuth discovery hint.
-    /// Shared between the fail-closed and bad-token paths.
+    /// Shared between the fail-closed and bad-token paths. (The specific
+    /// rejection reason is logged at each call site.)
     @MainActor
-    private func unauthorizedResponse(issuer: String, reason: String) -> Data {
+    private func unauthorizedResponse(issuer: String) -> Data {
         let body = Data(#"{"error":"unauthorized"}"#.utf8)
         // The MCP authorization spec discovers OAuth via the
         // `resource_metadata=...` parameter on this header. Without it,
         // remote clients can't find `/.well-known/oauth-protected-resource`
         // and the connector flow fails before it ever reaches /authorize.
         let metadataURL = "\(issuer)/.well-known/oauth-protected-resource"
-        _ = reason  // kept for log-grep symmetry with the call sites
         return HTTPParser.formatResponse(
             status: 401,
             body: body,
@@ -292,7 +294,7 @@ actor MCPServer {
     /// This affects discovery hints ONLY — `denyIfMissingAuth` validates the
     /// bearer token regardless of issuer, so a spoofed `Host` can't bypass
     /// auth or reach the index unauthenticated.
-    nonisolated private func issuerOrigin(for request: HTTPRequestLine) -> String {
+    nonisolated func issuerOrigin(for request: HTTPRequestLine) -> String {
         let host = (request.headers["host"] ?? "").trimmingCharacters(in: .whitespaces)
         if Self.isLoopbackHost(host) {
             return "http://\(host)"
@@ -305,7 +307,7 @@ actor MCPServer {
 
     /// True for `127.0.0.1`, `localhost`, or `::1`, with or without a port
     /// (and IPv6 bracket form `[::1]:8765`).
-    nonisolated private static func isLoopbackHost(_ host: String) -> Bool {
+    nonisolated static func isLoopbackHost(_ host: String) -> Bool {
         let h = host.lowercased()
         let name: String
         if h.hasPrefix("["), let close = h.firstIndex(of: "]") {
@@ -327,19 +329,6 @@ actor MCPServer {
         guard trimmed.lowercased().hasPrefix("bearer ") else { return "" }
         let after = trimmed.index(trimmed.startIndex, offsetBy: 7)
         return String(trimmed[after...]).trimmingCharacters(in: .whitespaces)
-    }
-
-    /// Constant-time string compare to keep timing attacks from learning
-    /// the token a byte at a time.
-    nonisolated private func constantTimeEqual(_ a: String, _ b: String) -> Bool {
-        let aBytes = Array(a.utf8)
-        let bBytes = Array(b.utf8)
-        if aBytes.count != bBytes.count { return false }
-        var diff: UInt8 = 0
-        for i in 0..<aBytes.count {
-            diff |= aBytes[i] ^ bBytes[i]
-        }
-        return diff == 0
     }
 
     private func readHTTPRequest(_ conn: NWConnection) async -> (HTTPRequestLine, Data)? {

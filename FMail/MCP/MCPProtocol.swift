@@ -8,7 +8,11 @@ enum MCPProtocol {
     /// MCP spec revision we report in `initialize`.
     static let version = "2024-11-05"
     static let serverName = "fmail"
-    static let serverVersion = "0.1.0"
+    /// Reported in `initialize` / the GET probe. Read from the bundle so it
+    /// can't drift from `CFBundleShortVersionString`.
+    static var serverVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1"
+    }
     static let mcpPath = "/mcp"
 }
 
@@ -256,12 +260,15 @@ enum HTTPParser {
     /// malicious header can't push `bodyEnd` past `Int.max`.
     static let maxBodyBytes = 32 * 1024 * 1024  // 32 MB
 
-    /// Format an HTTP/1.1 response with a JSON body and `Connection: close`.
+    /// Format an HTTP/1.1 response with `Connection: close`. Defaults to a
+    /// JSON content type; pass `contentType` for other bodies (e.g.
+    /// `"text/html; charset=utf-8"` for the OAuth approval page).
     /// `extraHeaders` adds key/value pairs verbatim (e.g.
     /// `["WWW-Authenticate": "Bearer"]` on 401 responses).
     static func formatResponse(
         status: Int = 200,
         body: Data,
+        contentType: String = "application/json",
         extraHeaders: [(String, String)] = []
     ) -> Data {
         let statusText: String
@@ -281,7 +288,7 @@ enum HTTPParser {
         }
         var header =
             "HTTP/1.1 \(status) \(statusText)\r\n" +
-            "Content-Type: application/json\r\n" +
+            "Content-Type: \(contentType)\r\n" +
             "Content-Length: \(body.count)\r\n" +
             "Connection: close\r\n"
         for (k, v) in extraHeaders {

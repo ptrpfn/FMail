@@ -73,21 +73,47 @@ final class EnvelopeIndexReader {
 /// via `close()` when done — explicit so we can release the SQLite handle
 /// before the next sync without waiting for ARC.
 final class EnvelopeReadOnly {
-    let db: OpaquePointer
+    private let db: OpaquePointer
+
+    /// `messages.type == 5` marks Gmail draft auto-saves — see `fetchAllMessages`
+    /// for why they're excluded from the mirror.
+    private static let draftAutosaveType = 5
 
     init(path: String) throws {
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
         var handle: OpaquePointer?
         let rc = sqlite3_open_v2(path, &handle, flags, nil)
-        if rc != SQLITE_OK {
+        guard rc == SQLITE_OK, let handle else {
             let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "rc=\(rc)"
             sqlite3_close(handle)
             throw EnvelopeIndexError.openFailed(msg)
         }
-        self.db = handle!
+        self.db = handle
     }
 
     func close() { sqlite3_close(db) }
+
+    // MARK: — SQLite helpers
+
+    /// Prepare a statement or throw `prepareFailed` with SQLite's message.
+    /// Callers own finalization (`defer { sqlite3_finalize(stmt) }`).
+    private func prepare(_ sql: String) throws -> OpaquePointer {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return stmt
+    }
+
+    /// NULL-safe text column read — returns `""` for NULL.
+    private static func text(_ stmt: OpaquePointer, _ col: Int32) -> String {
+        sqlite3_column_text(stmt, col).map { String(cString: $0) } ?? ""
+    }
+
+    /// NULL-safe text column read — returns `nil` for NULL.
+    private static func optText(_ stmt: OpaquePointer, _ col: Int32) -> String? {
+        sqlite3_column_text(stmt, col).map { String(cString: $0) }
+    }
 
     struct RawMessage {
         let rowId: Int
@@ -122,10 +148,7 @@ final class EnvelopeReadOnly {
     }
 
     func loadMailboxes() throws -> [Mailbox] {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT ROWID, url FROM mailboxes ORDER BY ROWID", -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let stmt = try prepare("SELECT ROWID, url FROM mailboxes ORDER BY ROWID")
         defer { sqlite3_finalize(stmt) }
 
         var out: [Mailbox] = []
@@ -150,7 +173,11 @@ final class EnvelopeReadOnly {
         return out
     }
 
-    func likelyEmailAddress(forAccountUUID uuid: String, mailboxes: [Mailbox]) throws -> String? {
+    /// Best-effort, never throws: a missing or unreadable address just yields
+    /// `nil` (the account falls back to a UUID-prefixed display name). SQL
+    /// failures are logged rather than thrown so one odd account can't abort
+    /// the whole sync.
+    func likelyEmailAddress(forAccountUUID uuid: String, mailboxes: [Mailbox]) -> String? {
         if let s = sentHeuristic(uuid: uuid, mailboxes: mailboxes) {
             return s
         }
@@ -184,8 +211,13 @@ final class EnvelopeReadOnly {
         ORDER BY c DESC
         LIMIT 1
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        let stmt: OpaquePointer
+        do {
+            stmt = try prepare(sql)
+        } catch {
+            Log.db.error("sentHeuristic prepare failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
         defer { sqlite3_finalize(stmt) }
         var idx: Int32 = 1
         for id in sentRowIds {
@@ -215,13 +247,18 @@ final class EnvelopeReadOnly {
         FROM recipients r
         JOIN addresses a ON a.ROWID = r.address
         JOIN messages m ON m.ROWID = r.message
-        WHERE m.mailbox IN (\(placeholders)) AND m.deleted = 0 AND r.type = 0
+        WHERE m.mailbox IN (\(placeholders)) AND m.deleted = 0 AND r.type = \(RecipientKind.to.rawValue)
         GROUP BY a.address
         ORDER BY c DESC
         LIMIT 1
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        let stmt: OpaquePointer
+        do {
+            stmt = try prepare(sql)
+        } catch {
+            Log.db.error("recipientHeuristic prepare failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
         defer { sqlite3_finalize(stmt) }
         for (idx, id) in mboxIds.enumerated() {
             sqlite3_bind_int64(stmt, Int32(idx + 1), Int64(id))
@@ -233,10 +270,7 @@ final class EnvelopeReadOnly {
     }
 
     func fetchAllLabels() throws -> [(messageRowId: Int, mailboxRowId: Int)] {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT message_id, mailbox_id FROM labels", -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let stmt = try prepare("SELECT message_id, mailbox_id FROM labels")
         defer { sqlite3_finalize(stmt) }
         var out: [(Int, Int)] = []
         out.reserveCapacity(300_000)
@@ -251,11 +285,8 @@ final class EnvelopeReadOnly {
     /// Backs the flag-only reconcile that runs when the menu opens, so external
     /// Mail.app read-state changes surface without a full re-mirror.
     func fetchReadFlags() throws -> [(rowid: Int, read: Bool)] {
-        let sql = "SELECT ROWID, read FROM messages WHERE deleted = 0 AND type != 5"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let sql = "SELECT ROWID, read FROM messages WHERE deleted = 0 AND type != \(Self.draftAutosaveType)"
+        let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         var out: [(rowid: Int, read: Bool)] = []
         out.reserveCapacity(160_000)
@@ -291,13 +322,10 @@ final class EnvelopeReadOnly {
         LEFT JOIN subjects s ON s.ROWID = m.subject
         LEFT JOIN addresses a ON a.ROWID = m.sender
         LEFT JOIN message_global_data mgd ON mgd.ROWID = m.global_message_id
-        WHERE m.deleted = 0 AND m.type != 5
+        WHERE m.deleted = 0 AND m.type != \(Self.draftAutosaveType)
         ORDER BY m.ROWID
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
 
         var out: [RawMessage] = []
@@ -306,19 +334,18 @@ final class EnvelopeReadOnly {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let hash = sqlite3_column_int64(stmt, 1)
             let mboxId = Int(sqlite3_column_int64(stmt, 2))
-            let urlStr = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-            let parsed = MailboxURL.parse(urlStr)
+            let parsed = MailboxURL.parse(Self.text(stmt, 3))
             let acct = parsed?.accountUUID ?? ""
-            let prefix = String(cString: sqlite3_column_text(stmt, 4))
-            let subj = String(cString: sqlite3_column_text(stmt, 5))
-            let saddr = String(cString: sqlite3_column_text(stmt, 6))
-            let sdisp = String(cString: sqlite3_column_text(stmt, 7))
+            let prefix = Self.text(stmt, 4)
+            let subj = Self.text(stmt, 5)
+            let saddr = Self.text(stmt, 6)
+            let sdisp = Self.text(stmt, 7)
             let ds = sqlite3_column_int64(stmt, 8)
             let dr = sqlite3_column_int64(stmt, 9)
             let read = sqlite3_column_int(stmt, 10) != 0
             let flagged = sqlite3_column_int(stmt, 11) != 0
             let hasAtt = sqlite3_column_int(stmt, 12) != 0
-            let rfcId = sqlite3_column_text(stmt, 13).map { String(cString: $0) }
+            let rfcId = Self.optText(stmt, 13)
             let uidVal = sqlite3_column_int64(stmt, 14)
             let uid: Int? = sqlite3_column_type(stmt, 14) == SQLITE_NULL ? nil : Int(uidVal)
 
@@ -343,10 +370,7 @@ final class EnvelopeReadOnly {
         JOIN addresses a ON a.ROWID = r.address
         ORDER BY r.message
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
 
         var out: [RawRecipient] = []
@@ -356,8 +380,8 @@ final class EnvelopeReadOnly {
                 messageRowId: Int(sqlite3_column_int64(stmt, 0)),
                 kind: Int(sqlite3_column_int64(stmt, 1)),
                 position: Int(sqlite3_column_int64(stmt, 2)),
-                address: String(cString: sqlite3_column_text(stmt, 3)),
-                display: String(cString: sqlite3_column_text(stmt, 4))
+                address: Self.text(stmt, 3),
+                display: Self.text(stmt, 4)
             ))
         }
         return out
@@ -365,10 +389,7 @@ final class EnvelopeReadOnly {
 
     func fetchAllReferences() throws -> [RawReference] {
         let sql = "SELECT message, reference, is_originator FROM message_references ORDER BY message"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
+        let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
 
         var out: [RawReference] = []

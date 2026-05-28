@@ -208,6 +208,83 @@ final class BodyLoaderTests: XCTestCase {
         XCTAssertEqual(byName["third.pdf"], a3)
     }
 
+    /// A message that arrives AFTER a mailbox's emlx map is first cached is
+    /// invisible until `invalidateAll()` drops the stale map. Regression test
+    /// for the cache-staleness bug (BodyLoader never self-refreshes; the sync
+    /// path must invalidate it).
+    func testInvalidateAllPicksUpNewlyArrivedMessage() async throws {
+        let mailbox = try makeFixture(
+            rowId: 100,
+            rfc822: "From: a@example.com\nSubject: first\n\nBody one.\n",
+            attachments: []
+        )
+        let loader = BodyLoader(mailVersionDir: tempRoot)
+
+        // Prime the cache for this mailbox.
+        _ = try await loader.loadBody(messageRowId: 100, mailbox: mailbox)
+
+        // A new message lands on disk in the same mailbox after caching.
+        let messagesDir = tempRoot
+            .appendingPathComponent(mailbox.accountUUID)
+            .appendingPathComponent("INBOX.mbox")
+            .appendingPathComponent("MAILBOX-UUID")
+            .appendingPathComponent("Data").appendingPathComponent("0")
+            .appendingPathComponent("0").appendingPathComponent("0")
+            .appendingPathComponent("Messages")
+        let rfc = "From: b@example.com\nSubject: second\n\nBody two.\n"
+        let rfcData = Data(rfc.utf8)
+        let framed = Data("\(rfcData.count)\n".utf8) + rfcData
+        try framed.write(to: messagesDir.appendingPathComponent("101.emlx"))
+
+        // Stale cache: the new message is not found.
+        let stale = try await loader.loadBody(messageRowId: 101, mailbox: mailbox)
+        XCTAssertNil(stale, "Stale per-mailbox cache should not see the new file yet")
+
+        // After invalidation the rescan finds it.
+        await loader.invalidateAll()
+        let fresh = try await loader.loadBody(messageRowId: 101, mailbox: mailbox)
+        let body = try XCTUnwrap(fresh, "invalidateAll() should let the rescan find the new message")
+        XCTAssertEqual(body.displayText.trimmingCharacters(in: .whitespacesAndNewlines), "Body two.")
+    }
+
+    /// A `.partial.emlx` cached before its full `.emlx` lands keeps resolving
+    /// to the partial until `invalidateAll()`; afterwards the full body wins.
+    func testInvalidateAllUpgradesPartialToFull() async throws {
+        let rowId = 102
+        let mailbox = try makeFixture(
+            rowId: rowId,
+            rfc822: "From: a@example.com\nSubject: t\n\nPARTIAL body.\n",
+            attachments: []
+        )
+        let loader = BodyLoader(mailVersionDir: tempRoot)
+        let partial = try await loader.loadBody(messageRowId: rowId, mailbox: mailbox)
+        XCTAssertEqual(
+            try XCTUnwrap(partial).displayText.trimmingCharacters(in: .whitespacesAndNewlines),
+            "PARTIAL body."
+        )
+
+        // Full body lands; full always wins over partial once the map rebuilds.
+        let messagesDir = tempRoot
+            .appendingPathComponent(mailbox.accountUUID)
+            .appendingPathComponent("INBOX.mbox")
+            .appendingPathComponent("MAILBOX-UUID")
+            .appendingPathComponent("Data").appendingPathComponent("0")
+            .appendingPathComponent("0").appendingPathComponent("0")
+            .appendingPathComponent("Messages")
+        let rfc = "From: a@example.com\nSubject: t\n\nFULL body.\n"
+        let rfcData = Data(rfc.utf8)
+        let framed = Data("\(rfcData.count)\n".utf8) + rfcData
+        try framed.write(to: messagesDir.appendingPathComponent("\(rowId).emlx"))
+
+        await loader.invalidateAll()
+        let full = try await loader.loadBody(messageRowId: rowId, mailbox: mailbox)
+        XCTAssertEqual(
+            try XCTUnwrap(full).displayText.trimmingCharacters(in: .whitespacesAndNewlines),
+            "FULL body.",
+            "After invalidation, the full .emlx should replace the .partial.emlx"
+        )
+    }
+
     /// Inline attachment whose bytes ARE in the emlx (no X-Apple-Content-Length)
     /// must not be clobbered by the external-attachment fill pass.
     func testInlineAttachmentBytesArePreserved() async throws {

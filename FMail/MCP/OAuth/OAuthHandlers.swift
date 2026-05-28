@@ -222,20 +222,11 @@ enum OAuthHandlers {
 
     /// Wrap an HTML string in an HTTP response with `Content-Type: text/html`.
     private static func htmlResponse(status: Int, html: String) -> Data {
-        let body = Data(html.utf8)
-        // Override the default Content-Type via the extraHeaders path — we
-        // can't change the existing application/json default, so we patch
-        // it after by writing our own response. Simpler: re-emit a small
-        // response with the right header inline.
-        let statusText = statusText(for: status)
-        var header = "HTTP/1.1 \(status) \(statusText)\r\n"
-        header += "Content-Type: text/html; charset=utf-8\r\n"
-        header += "Content-Length: \(body.count)\r\n"
-        header += "Connection: close\r\n"
-        header += "\r\n"
-        var out = Data(header.utf8)
-        out.append(body)
-        return out
+        HTTPParser.formatResponse(
+            status: status,
+            body: Data(html.utf8),
+            contentType: "text/html; charset=utf-8"
+        )
     }
 
     private static func errorResponse(status: Int, code: String, description: String) -> Data {
@@ -245,20 +236,6 @@ enum OAuthHandlers {
         ]
         let body = (try? JSONEncoder().encode(JSONValue.object(payload))) ?? Data("{}".utf8)
         return HTTPParser.formatResponse(status: status, body: body)
-    }
-
-    private static func statusText(for status: Int) -> String {
-        switch status {
-        case 200: return "OK"
-        case 201: return "Created"
-        case 302: return "Found"
-        case 400: return "Bad Request"
-        case 401: return "Unauthorized"
-        case 403: return "Forbidden"
-        case 404: return "Not Found"
-        case 405: return "Method Not Allowed"
-        default: return "OK"
-        }
     }
 
     private static func percentEncode(_ s: String) -> String {

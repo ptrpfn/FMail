@@ -153,15 +153,6 @@ enum Schema {
         }
     }
 
-    /// Recipient `kind` codes (matching Apple's `recipients.type`):
-    /// 0 = to, 1 = cc, 2 = bcc, 3 = from (informational).
-    enum RecipientKind: Int {
-        case to = 0
-        case cc = 1
-        case bcc = 2
-        case from = 3
-    }
-
     /// v7: per-account writeback service preference. Lets the user route
     /// move/delete/mark-read either through AppleScript (the default,
     /// existing behaviour) or — once authorized — through a server-direct
@@ -281,7 +272,7 @@ enum Schema {
         }
     }
 
-    /// v2: add Phase 4 contact preference table.
+    /// v2: contact preference table (reserved; not yet read/written by code).
     private static func migrateTo2(_ db: OpaquePointer) throws {
         let statements = [
             """
