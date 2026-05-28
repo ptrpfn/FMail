@@ -296,7 +296,8 @@ claude.ai's "Custom Connector" flow uses OAuth, not a static token:
 9. **MCP/Tunnel → Open approval window** (opens a 5-minute window).
 10. In claude.ai → add a custom connector → URL `https://fmail.your-domain.com/mcp`.
 11. claude.ai opens FMail's `/authorize` page in your browser — click **Approve** while the window is
-    open. The issued session token is persisted, so the connector survives FMail restarts.
+    open. The issued session token is persisted, so the connector survives FMail restarts. To revoke a
+    paired connector later, use **Settings → Paired sessions → Revoke all paired sessions**.
 
 ### Who can connect over the tunnel
 
@@ -318,8 +319,11 @@ In short: a third-party app can't get in on its own; it needs either your static
 you actively grant during the window.
 
 Caveat — these are **bearer** tokens: whoever holds a valid one can use it until it expires (OAuth
-sessions last 30 days) or you rotate the static token. Treat the static token like a password, and
-keep the tunnel closed when you're not using it.
+sessions last 30 days) or you revoke it. To cut off OAuth-paired clients immediately, use
+**Settings → Paired sessions → Revoke all paired sessions** — revocation is instant, and the next
+request from a revoked client gets a 401 and must re-authorize. To rotate the static token, generate a
+new one in **Settings → Auth token** (update your client configs to match). Treat the static token like
+a password, and keep the tunnel closed when you're not using it.
 
 ### Threat model (worth being honest about)
 

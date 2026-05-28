@@ -13,6 +13,7 @@ struct MinimalSettingsView: View {
     @State private var tunnelName = MCPSettings.tunnelName
     @State private var publicURL = MCPSettings.tunnelPublicURL
     @State private var cloudflaredPath = MCPSettings.cloudflaredPath
+    @State private var sessionCount = OAuthStore.shared.sessions.count
 
     var body: some View {
         Form {
@@ -51,8 +52,26 @@ struct MinimalSettingsView: View {
                 TextField("cloudflared path (optional)", text: $cloudflaredPath)
                     .onChange(of: cloudflaredPath) { _, new in MCPSettings.cloudflaredPath = new }
             }
+
+            Section("Paired sessions") {
+                HStack {
+                    Text(sessionCount == 0
+                         ? "No paired sessions"
+                         : "\(sessionCount) paired session\(sessionCount == 1 ? "" : "s")")
+                    Spacer()
+                    Button("Revoke all paired sessions") {
+                        OAuthStore.shared.revokeAllSessions()
+                        sessionCount = OAuthStore.shared.sessions.count
+                    }
+                    .disabled(sessionCount == 0)
+                }
+                Text("OAuth-paired remote clients (e.g. a claude.ai connector). Revoking is immediate — the next request from a revoked client gets a 401 and it must re-authorize.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 380)
+        .frame(width: 460, height: 440)
+        .onAppear { sessionCount = OAuthStore.shared.sessions.count }
     }
 }
