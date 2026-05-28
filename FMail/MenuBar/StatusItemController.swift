@@ -21,6 +21,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // Persistent items mutated on each open.
     private let markAllItem = NSMenuItem()
+    private let mcpTunnelItem = NSMenuItem()
     private let mcpItem = NSMenuItem()
     private let tunnelOpenItem = NSMenuItem()
     private let approvalItem = NSMenuItem()
@@ -65,25 +66,26 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         markAllItem.action = #selector(markAllAsRead)
         menu.addItem(markAllItem)
 
+        // MCP + the (more sensitive) tunnel live together under one item so
+        // the tunnel's running state is visible at the top level via the
+        // parent's checkmark.
+        mcpTunnelItem.title = "MCP/Tunnel"
+        let subMenu = NSMenu()
+        subMenu.autoenablesItems = false
         mcpItem.title = "MCP"
         mcpItem.target = self
         mcpItem.action = #selector(toggleMCP)
-        menu.addItem(mcpItem)
-
-        let tunnelItem = NSMenuItem()
-        tunnelItem.title = "Tunnel"
-        let tunnelSubmenu = NSMenu()
-        tunnelSubmenu.autoenablesItems = false
+        subMenu.addItem(mcpItem)
         tunnelOpenItem.title = "Open tunnel"
         tunnelOpenItem.target = self
         tunnelOpenItem.action = #selector(toggleTunnel)
-        tunnelSubmenu.addItem(tunnelOpenItem)
+        subMenu.addItem(tunnelOpenItem)
         approvalItem.title = "Open approval window"
         approvalItem.target = self
         approvalItem.action = #selector(toggleApproval)
-        tunnelSubmenu.addItem(approvalItem)
-        tunnelItem.submenu = tunnelSubmenu
-        menu.addItem(tunnelItem)
+        subMenu.addItem(approvalItem)
+        mcpTunnelItem.submenu = subMenu
+        menu.addItem(mcpTunnelItem)
 
         let searchItem = NSMenuItem()
         searchItem.view = searchView
@@ -130,10 +132,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         currentSearchText = ""
         selectedRowIds.removeAll()
 
+        let tunnelLive = model.tunnel.state.isLive
         mcpItem.state = MCPSettings.enabled ? .on : .off
-        tunnelOpenItem.state = model.tunnel.state.isLive ? .on : .off
+        tunnelOpenItem.state = tunnelLive ? .on : .off
         tunnelOpenItem.title = tunnelOpenTitle()
         approvalItem.state = OAuthStore.shared.approvalWindowIsOpen ? .on : .off
+        // Parent checkmark tracks the tunnel only — it's the sensitive,
+        // publicly-exposed state. A check here means "tunnel live"; the title
+        // spells it out too.
+        mcpTunnelItem.state = tunnelLive ? .on : .off
+        mcpTunnelItem.title = tunnelLive ? "MCP/Tunnel — Tunnel live" : "MCP/Tunnel"
 
         updateEmailItems()   // show cached rows instantly
         refreshEmails()      // refresh from the current index
@@ -162,6 +170,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             if Task.isCancelled { return }
             self.emails = results
             self.updateEmailItems()
+            // Keep the menu-bar count in step with the list — recompute the
+            // unread total from the same index state the rows came from, so
+            // the badge can't lag behind the visible rows.
+            if let count = try? await self.model.indexDB?.countAllUnreadExcludingDrafts() {
+                if Task.isCancelled { return }
+                self.model.allUnreadCount = count
+                self.updateStatusBadge()
+            }
         }
     }
 
@@ -372,16 +388,37 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleMCP() {
         MCPSettings.enabled.toggle()
         model.applyMCPSettings()
+        // The tunnel can't function without MCP — switching MCP off tears the
+        // (sensitive, publicly-exposed) tunnel down with it.
+        if !MCPSettings.enabled, model.tunnel.state.isLive {
+            Task { @MainActor in await model.tunnel.stop() }
+        }
     }
 
     @objc private func toggleTunnel() {
         Task { @MainActor in
             if model.tunnel.state.isLive {
                 await model.tunnel.stop()
-            } else {
-                await model.tunnel.start()
+                return
             }
+            // The tunnel can't run without the MCP server. If MCP isn't up
+            // yet, switch it on and wait for it to start — otherwise
+            // tunnel.start() refuses with `.mcpNotRunning`.
+            if !isMCPRunning {
+                MCPSettings.enabled = true
+                model.applyMCPSettings()
+                for _ in 0..<30 {
+                    if isMCPRunning { break }
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            }
+            await model.tunnel.start()
         }
+    }
+
+    private var isMCPRunning: Bool {
+        if case .running = model.mcpServerStatus { return true }
+        return false
     }
 
     @objc private func toggleApproval() {

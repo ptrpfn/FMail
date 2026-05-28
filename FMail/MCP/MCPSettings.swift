@@ -13,8 +13,14 @@ enum MCPSettings {
     static let tunnelNameKey = "mcp.tunnel.name"
     static let tunnelPublicURLKey = "mcp.tunnel.publicURL"
 
+    /// On by default after a fresh start; an explicit toggle-off persists.
+    /// (The server is loopback-only and, once a tunnel is configured, requires
+    /// the auth token — so default-on is safe for this single-user tool.)
     static var enabled: Bool {
-        get { UserDefaults.standard.bool(forKey: enabledKey) }
+        get {
+            guard UserDefaults.standard.object(forKey: enabledKey) != nil else { return true }
+            return UserDefaults.standard.bool(forKey: enabledKey)
+        }
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
     }
 
