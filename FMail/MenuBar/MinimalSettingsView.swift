@@ -13,7 +13,10 @@ struct MinimalSettingsView: View {
     @State private var tunnelName = MCPSettings.tunnelName
     @State private var publicURL = MCPSettings.tunnelPublicURL
     @State private var cloudflaredPath = MCPSettings.cloudflaredPath
-    @State private var sessionCount = OAuthStore.shared.sessions.count
+
+    /// Read live from the (now `@Observable`) store so a pairing or revoke
+    /// updates the row immediately — no `.onAppear` re-sampling needed.
+    private var sessionCount: Int { OAuthStore.shared.sessions.count }
 
     var body: some View {
         Form {
@@ -61,7 +64,6 @@ struct MinimalSettingsView: View {
                     Spacer()
                     Button("Revoke all paired sessions") {
                         OAuthStore.shared.revokeAllSessions()
-                        sessionCount = OAuthStore.shared.sessions.count
                     }
                     .disabled(sessionCount == 0)
                 }
@@ -72,6 +74,5 @@ struct MinimalSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 460, height: 440)
-        .onAppear { sessionCount = OAuthStore.shared.sessions.count }
     }
 }

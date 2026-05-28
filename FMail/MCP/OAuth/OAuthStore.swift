@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// State for the MCP OAuth flow:
 ///
@@ -17,7 +18,11 @@ import Foundation
 /// All state lives on the main actor; `MCPServer` handlers hop in to read/
 /// write. Pending codes are scrubbed lazily on access; explicit GC isn't
 /// needed at our scale (one user, a handful of OAuth grants ever).
+///
+/// `@Observable` so SwiftUI (the Settings "Paired sessions" row) re-renders
+/// when `sessions` changes — a new pairing or a revoke updates the count live.
 @MainActor
+@Observable
 final class OAuthStore {
     static let shared = OAuthStore()
 
