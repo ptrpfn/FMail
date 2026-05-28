@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import SwiftUI
 
 /// Owns the menu-bar `NSStatusItem` and its drop-down `NSMenu`. The menu is
 /// built once in `init`; `menuNeedsUpdate` only mutates the existing items
@@ -39,6 +40,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// time the menu opens or the search text changes. Drives whether the top
     /// command reads "Mark all as read" (empty) or "Mark N as read".
     private var selectedRowIds: Set<Int> = []
+
+    /// Settings window, created on first open and reused (see `openSettings`).
+    private var settingsWindow: NSWindow?
 
     init(model: MailModel) {
         self.model = model
@@ -445,13 +449,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         Task { _ = await MailScripter.composeViaMailApp(entry, kind: kind) }
     }
 
+    /// Host Settings in a real AppKit window. The SwiftUI `Settings` scene's
+    /// `showSettingsWindow:` action doesn't fire for an `LSUIElement` accessory
+    /// app (no key window / no main menu to route through), so we own the
+    /// window directly and reuse it across opens.
     @objc private func openSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        if #available(macOS 14, *) {
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        } else {
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        if settingsWindow == nil {
+            let hosting = NSHostingController(rootView: MinimalSettingsView(model: model))
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "FMail Settings"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            settingsWindow = window
         }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        settingsWindow?.orderFrontRegardless()
     }
 
     @objc private func openFullDiskAccess() {
