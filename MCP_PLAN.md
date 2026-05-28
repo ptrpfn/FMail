@@ -2,6 +2,19 @@
 
 Status: **plan validated against the codebase; ready to implement.** Pick this up by working through the phases below. Validation pass added the "Reality corrections" section (after Locked decisions) — read it before touching code.
 
+> **⚠️ Current behaviour differs from this plan in a few places (menu-bar build).** The MCP server is
+> now **on by default** (an explicit toggle-off persists), and lives behind the menu's **MCP/Tunnel**
+> submenu rather than a Settings pane — MCP toggle, Open tunnel, and Open approval window are all menu
+> items; Settings only holds the set-once values (auth token, port, tunnel name/URL, cloudflared path).
+> The MCP surface is **eight read-only tools** — the write tools described below (`mark_read`,
+> `delete_messages`, `move_to_junk`, `diagnose_junk_mailboxes`) were **removed**; Mail state changes
+> go through Mail.app. OAuth discovery metadata is **host-aware**: a loopback request advertises
+> `http://127.0.0.1:<port>` as the resource/issuer (so a local client's RFC 8707 resource check
+> matches), while tunnel requests use the configured public URL — the bearer check is independent of
+> the advertised issuer. Local Claude Code authenticates with the **static token in an `Authorization`
+> header** (no OAuth). See [README.md](README.md) for the current setup steps. The protocol/transport/
+> tool design below is otherwise accurate.
+
 Goal: when FMail.app is running, expose an MCP server on `127.0.0.1:8765` so Claude Code (or any MCP-compatible LLM client) can query the FMail index and mark messages read. The point is to leverage the existing index/threading/DSL so the LLM can triage email without loading everything into context. Standalone daemon (LaunchAgent) is **not** in scope for v1; we accept the lifecycle constraint that FMail must be open. See `FMailSpec.md` §10/§12 for the wider context.
 
 ## Use cases this is meant to enable

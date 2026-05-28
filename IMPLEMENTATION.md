@@ -2,7 +2,18 @@
 
 Companion to `FMailSpec.md`. The spec captures the design intent; this file captures **what's actually shipped**, what diverges from the spec, and what's left.
 
-Last updated: 2026-05-09.
+Last updated: 2026-05-09 (window-UI era).
+
+> **⚠️ Current UI is menu-bar-only.** Everything below documents the three-pane **window** app, now
+> preserved on the [`window-UI`](../../tree/window-UI) branch. `master` ships a **menu-bar** build: a
+> status-bar dropdown with the unread/search list (multi-select mark-as-read), per-email
+> Open-in-Mail / Reply / Reply All / Forward via Mail.app's native AppleScript commands, and an
+> MCP/Tunnel submenu. Removed in the menu-bar build: `AppShell`, the sidebar/thread-list/reader views,
+> `HTMLBodyView`, `ReplyConfirmationSheet`, `ContactsService`, the `mailto:` `MailComposer`, and
+> contact-prefs. Added: `MenuBar/{AppDelegate, StatusItemController, MenuEmailRowView,
+> MenuSearchFieldView, MinimalSettingsView}.swift`, a flag-only read/unread reconcile on menu open,
+> host-aware MCP OAuth discovery, and MCP **on by default**. The index / search DSL / threading / MCP
+> data layer is unchanged. Current behaviour and setup: [README.md](README.md).
 
 ---
 
