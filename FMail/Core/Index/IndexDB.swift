@@ -719,8 +719,14 @@ actor IndexDB {
         )
         """
 
-    /// "All Mailboxes" view: every thread that contains at least one message
-    /// outside drafts/trash/junk, newest first.
+    /// "All Mailboxes" view: the most-recent `limit` threads outside
+    /// drafts/trash/junk, newest first, **plus every thread that still has an
+    /// unread message** regardless of age. The unread badge
+    /// (`countAllUnreadExcludingDrafts`) counts every unread message with no
+    /// recency limit; if the list only showed the recent window, an unread
+    /// email older than that window would be counted but never displayed —
+    /// the user sees "N unread" with nothing to click. Including unread
+    /// threads unconditionally keeps the badge and the list reconciled.
     ///
     /// Synthetic thread ids: a message that hasn't been threaded yet
     /// (thread_id = 0, the schema default in the gap between `upsertMessages`
@@ -740,7 +746,7 @@ actor IndexDB {
             FROM messages m
             WHERE \(Self.systemMailboxExcludeFilter)
         ),
-        thread_data AS (
+        thread_data AS MATERIALIZED (
             SELECT thread_id,
                    MAX(date_received) AS latest,
                    COUNT(apple_rowid) AS local_count,
@@ -749,32 +755,46 @@ actor IndexDB {
             FROM visible
             GROUP BY thread_id
         )
+        -- Recent window OR any unread thread (see method doc). MATERIALIZED so
+        -- the GROUP BY over `visible` is computed once, not re-run for the IN
+        -- subquery.
         SELECT thread_id, latest, local_count, unread_count, flagged_count
         FROM thread_data
+        WHERE unread_count > 0
+           OR thread_id IN (
+               SELECT thread_id FROM thread_data ORDER BY latest DESC LIMIT ?
+           )
         ORDER BY latest DESC
-        LIMIT ?
         """
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         // Fetch headroom so the outgoing-dedup pass can skip rows without
-        // shrinking the result below the caller's expected `limit`.
+        // shrinking the recent window below the caller's expected `limit`.
         let fetchLimit = min(limit * 2, 1500)
         bind(stmt, 1, Int64(fetchLimit))
         var out: [ThreadSummary] = []
         var seenOutgoingKeys: Set<String> = []
+        var readThreadCount = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if out.count >= limit { break }
             let tid = Int(sqlite3_column_int64(stmt, 0))
             let latest = Int(sqlite3_column_int64(stmt, 1))
             let local = Int(sqlite3_column_int64(stmt, 2))
             let unread = Int(sqlite3_column_int64(stmt, 3))
             let flagged = Int(sqlite3_column_int64(stmt, 4))
+            // Cap only fully-read threads at `limit`; unread threads are always
+            // kept so the list can never fall behind the unread badge. Rows
+            // arrive newest-first, so an old unread thread still lands in its
+            // natural date position rather than being dropped.
+            if unread == 0 && readThreadCount >= limit { continue }
             let repr = try latestNonDraftMessageOfThread(threadId: tid)
-            if let key = Self.outgoingDedupKey(for: repr) {
+            // Outgoing dedup only collapses fully-read duplicates — never drop
+            // an unread thread, or the badge and list would disagree again.
+            if unread == 0, let key = Self.outgoingDedupKey(for: repr) {
                 if seenOutgoingKeys.contains(key) { continue }
                 seenOutgoingKeys.insert(key)
             }
+            if unread == 0 { readThreadCount += 1 }
             out.append(ThreadSummary(
                 threadId: tid,
                 latestDateReceived: latest > 0 ? Date(timeIntervalSince1970: TimeInterval(latest)) : nil,
@@ -855,7 +875,7 @@ actor IndexDB {
             FROM messages m
             WHERE m.apple_rowid IN (SELECT apple_rowid FROM mailbox_messages)
         ),
-        thread_data AS (
+        thread_data AS MATERIALIZED (
             SELECT thread_id,
                    MAX(date_received) AS latest,
                    COUNT(apple_rowid) AS local_count,
@@ -864,10 +884,16 @@ actor IndexDB {
             FROM visible
             GROUP BY thread_id
         )
+        -- Recent window OR any unread thread, so this mailbox's list can never
+        -- fall behind its unread badge (same invariant as the All-Mailboxes
+        -- view). MATERIALIZED so the GROUP BY runs once.
         SELECT thread_id, latest, local_count, unread_count, flagged_count
         FROM thread_data
+        WHERE unread_count > 0
+           OR thread_id IN (
+               SELECT thread_id FROM thread_data ORDER BY latest DESC LIMIT ?
+           )
         ORDER BY latest DESC
-        LIMIT ?
         """
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
@@ -878,19 +904,26 @@ actor IndexDB {
         bind(stmt, 3, Int64(fetchLimit))
         var out: [ThreadSummary] = []
         var seenOutgoingKeys: Set<String> = []
+        var readThreadCount = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if out.count >= limit { break }
             let tid = Int(sqlite3_column_int64(stmt, 0))
             let latest = Int(sqlite3_column_int64(stmt, 1))
             let local = Int(sqlite3_column_int64(stmt, 2))
             let unread = Int(sqlite3_column_int64(stmt, 3))
             let flagged = Int(sqlite3_column_int64(stmt, 4))
+            // Cap only fully-read threads at `limit`; unread threads are always
+            // kept (they arrive newest-first, so old unread lands in its date
+            // position rather than being dropped past the cap).
+            if unread == 0 && readThreadCount >= limit { continue }
             // Pull representative message info (latest in the thread within this mailbox).
             let repr = try latestMessageOfThreadInMailbox(threadId: tid, mailboxRowId: mailboxRowId)
-            if let key = Self.outgoingDedupKey(for: repr) {
+            // Outgoing dedup only collapses fully-read duplicates — never drop
+            // an unread thread.
+            if unread == 0, let key = Self.outgoingDedupKey(for: repr) {
                 if seenOutgoingKeys.contains(key) { continue }
                 seenOutgoingKeys.insert(key)
             }
+            if unread == 0 { readThreadCount += 1 }
             out.append(ThreadSummary(
                 threadId: tid,
                 latestDateReceived: latest > 0 ? Date(timeIntervalSince1970: TimeInterval(latest)) : nil,
