@@ -21,6 +21,7 @@ enum MCPTools {
         await dispatcher.register(getEmailTool(context: context))
         await dispatcher.register(getAttachmentTool(context: context))
         await dispatcher.register(getAttachmentsForRowidsTool(context: context))
+        await dispatcher.register(fetchFromServerTool(context: context))
         await dispatcher.register(findUnansweredTool(context: context))
     }
 
@@ -276,10 +277,22 @@ enum MCPTools {
             JSON attachments; awkward for binaries.
 
             Get the attachment index from `get_email` / `get_thread`'s
-            `attachments` array (same order). The body must be on disk
-            (check `body_on_disk` on the search result row); if not, the
-            call errors and the user has to open the message in Mail.app
-            once to trigger an IMAP fetch.
+            `attachments` array (same order).
+
+            **Offloaded attachments:** Apple Mail's "Optimise Mac Storage"
+            keeps the body on disk while evicting attachment binaries — so
+            `body_on_disk: true` does NOT guarantee attachment bytes are
+            local. Check `locally_available` per attachment (surfaced by
+            `search_emails include_attachment_metadata: true` and by
+            `get_email` / `get_thread`). When false, either:
+              - pass `download_if_missing: true` here (synchronous: this
+                call drives Mail.app to refetch from the IMAP/Gmail
+                server and waits up to `timeout_seconds`), or
+              - call `fetch_from_server` first, then re-call this tool.
+
+            Without the flag, a call against an offloaded attachment
+            returns a structured `attachment_not_downloaded_locally`
+            error rather than silently writing a 0-byte file.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -299,11 +312,75 @@ enum MCPTools {
                         "minimum": .int(0),
                         "default": .int(Int64(AttachmentDefaults.maxBase64Bytes)),
                         "description": .string("Only used when save_to_path is unset. Cap on raw (pre-base64) bytes returned. Larger attachments come back with truncated=true.")
+                    ]),
+                    "download_if_missing": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("When the attachment bytes are offloaded by Apple Mail, ask Mail.app to refetch from the server and wait up to `timeout_seconds`. Requires Mail.app to be running and the account online. Default false (errors fast with a structured reason instead).")
+                    ]),
+                    "timeout_seconds": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(1),
+                        "maximum": .int(Int64(AttachmentDefaults.maxFetchTimeoutSeconds)),
+                        "default": .int(Int64(AttachmentDefaults.fetchTimeoutSeconds)),
+                        "description": .string("Only used with download_if_missing. Max seconds to wait for Mail.app to deliver the bytes.")
                     ])
                 ]),
                 "required": .array([.string("rowid"), .string("attachment_index")])
             ]),
             handler: { args in try await MCPHandlers.getAttachment(args, context: context) }
+        )
+    }
+
+    // MARK: — fetch_from_server
+
+    private static func fetchFromServerTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "fetch_from_server",
+            description: """
+            Ask Mail.app to pull a message back from its IMAP/Gmail server
+            (body + attachments), then return refreshed attachment
+            metadata. Use this when `search_emails` /  `get_email` shows
+            `locally_available: false` on an attachment, or after a
+            `get_attachment` returned `attachment_not_downloaded_locally`.
+
+            With `attachment_index` + `save_to_path`, the same call also
+            writes that one attachment to disk and returns `saved`. With
+            `attachment_index` alone, the call just refreshes the metadata
+            (now-correct `byte_count`, `locally_available`). Without an
+            index, every attachment of the message is refreshed.
+
+            Synchronous: this tool waits up to `timeout_seconds` for the
+            bytes to materialise. On timeout the response carries
+            `materialised: false` and an `error` describing why
+            (Mail.app not running, account offline, server slow). Requires
+            Apple Mail's Automation permission (the same permission Mark
+            as Read uses).
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowid": .object(["type": .string("integer")]),
+                    "attachment_index": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "description": .string("Optional. When set, the call confirms this specific attachment materialised; combine with `save_to_path` to also write it in the same call.")
+                    ]),
+                    "save_to_path": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional. Requires `attachment_index`. Filesystem path to write the decoded bytes to; tilde-expanded, relative resolved against $HOME.")
+                    ]),
+                    "timeout_seconds": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(1),
+                        "maximum": .int(Int64(AttachmentDefaults.maxFetchTimeoutSeconds)),
+                        "default": .int(Int64(AttachmentDefaults.fetchTimeoutSeconds)),
+                        "description": .string("Max seconds to wait for Mail.app to deliver the bytes.")
+                    ])
+                ]),
+                "required": .array([.string("rowid")])
+            ]),
+            handler: { args in try await MCPHandlers.fetchFromServer(args, context: context) }
         )
     }
 

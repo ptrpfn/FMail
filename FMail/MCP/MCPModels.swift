@@ -52,6 +52,13 @@ struct AttachmentRef: Codable, Sendable {
     let name: String
     let content_type: String
     let byte_count: Int
+    /// `true` when the decoded bytes are present on disk right now (i.e. a
+    /// `get_attachment` call would succeed). `false` when Apple Mail has
+    /// offloaded the binary ("Optimise Mac Storage") — `byte_count` is 0 in
+    /// that case, and a call to `fetch_from_server` (or `get_attachment` with
+    /// `download_if_missing: true`) is required to pull it back.
+    /// Optional for backward-compat with consumers that don't surface it.
+    let locally_available: Bool?
 }
 
 /// Attachment bytes returned by `get_attachment` *without* `save_to_path`.
@@ -251,6 +258,26 @@ enum ThreadDirection: String, Sendable {
 
 struct FindUnansweredThreadsResult: Codable, Sendable {
     let threads: [UnansweredThread]
+}
+
+/// Outcome of `fetch_from_server`. When `attachment_index` + `save_to_path`
+/// are supplied, `saved` is populated with the on-disk write result;
+/// otherwise the response carries only the refreshed attachment metadata
+/// (now-correct `byte_count` / `locally_available`).
+struct FetchFromServerResult: Codable, Sendable {
+    let rowid: Int
+    /// `true` when at least one attachment was successfully materialised; for
+    /// the message-body refresh case (no `attachment_index`), `true` when the
+    /// body became readable. `false` on timeout.
+    let materialised: Bool
+    /// Refreshed metadata for every attachment of the message.
+    let attachments: [AttachmentRef]
+    /// Populated only when `attachment_index` + `save_to_path` are supplied
+    /// and the write succeeded.
+    let saved: AttachmentSaved?
+    /// Filled when materialisation timed out or another structured error
+    /// occurred; otherwise nil.
+    let error: String?
 }
 
 // MARK: — Date / encoding helpers

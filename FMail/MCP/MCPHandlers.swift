@@ -73,7 +73,7 @@ enum MCPHandlers {
                     continue
                 }
                 attachmentsByRowid[m.rowId] = body.attachments.map {
-                    AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count)
+                    AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count, locally_available: !$0.data.isEmpty)
                 }
             }
         }
@@ -389,7 +389,7 @@ enum MCPHandlers {
             fullChars: processed.count,
             htmlPresent: body.html != nil && !(body.html ?? "").isEmpty,
             attachments: body.attachments.map {
-                AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count)
+                AttachmentRef(name: $0.name, content_type: $0.contentType, byte_count: $0.data.count, locally_available: !$0.data.isEmpty)
             }
         )
     }

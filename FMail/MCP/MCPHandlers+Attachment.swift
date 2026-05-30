@@ -30,6 +30,11 @@ extension MCPHandlers {
         }
         let savePath = obj["save_to_path"]?.stringValue?.trimmingCharacters(in: .whitespaces)
         let maxBytes = max(0, obj["max_bytes"]?.intValue ?? AttachmentDefaults.maxBase64Bytes)
+        let downloadIfMissing = obj["download_if_missing"]?.boolValue ?? false
+        let timeoutSeconds = MCPHelpers.clampInt(
+            obj["timeout_seconds"]?.intValue ?? AttachmentDefaults.fetchTimeoutSeconds,
+            min: 1, max: AttachmentDefaults.maxFetchTimeoutSeconds
+        )
 
         guard let msg = try await context.indexDB.loadMessage(rowid: rowid) else {
             throw JSONRPCErrorPayload(
@@ -56,7 +61,33 @@ extension MCPHandlers {
             )
         }
 
-        let att = body.attachments[attIdx]
+        var att = body.attachments[attIdx]
+
+        // Offloaded by Apple Mail's "Optimise Mac Storage": body is on disk
+        // but attachment bytes aren't. Two paths: error out (default), or
+        // ask Mail.app to refetch (when the caller opts in).
+        if att.data.isEmpty {
+            guard downloadIfMissing else {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.invalidParams,
+                    message: "get_attachment: attachment_not_downloaded_locally — rowid \(rowid) attachment \(attIdx) ('\(att.name)') has been offloaded by Apple Mail. Re-call with download_if_missing: true (or call fetch_from_server first) to have Mail.app refetch from the IMAP/Gmail server."
+                )
+            }
+            guard let refreshed = await refetchBody(
+                    for: msg, mailbox: mailbox,
+                    requiringAttachmentIndex: attIdx,
+                    timeoutSeconds: TimeInterval(timeoutSeconds),
+                    context: context),
+                  attIdx < refreshed.attachments.count,
+                  !refreshed.attachments[attIdx].data.isEmpty
+            else {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.internalError,
+                    message: "get_attachment: Mail.app didn't deliver attachment \(attIdx) ('\(att.name)') for rowid \(rowid) within \(timeoutSeconds)s — check Mail.app is running and the account is online, then retry."
+                )
+            }
+            att = refreshed.attachments[attIdx]
+        }
 
         if let savePath, !savePath.isEmpty {
             // Disk-write mode — sidesteps the per-tool-call payload cap.
@@ -183,6 +214,18 @@ extension MCPHandlers {
             }
 
             for (idx, att) in body.attachments.enumerated() {
+                // Don't write 0-byte files for offloaded attachments — that
+                // was the silent-success bug. Route them into errors with a
+                // machine-readable reason so the caller can re-fetch via
+                // `fetch_from_server` (or `get_attachment download_if_missing`).
+                if att.data.isEmpty {
+                    errors.append(.errorRow(
+                        rowid: rowid,
+                        attachment_index: idx,
+                        message: "attachment_not_downloaded_locally — '\(att.name)' has been offloaded by Apple Mail; call fetch_from_server(rowid: \(rowid), attachment_index: \(idx), save_to_path: ...) to pull it back"
+                    ))
+                    continue
+                }
                 let safeName = sanitiseFilename(att.name)
                 let path = (perMsgDir as NSString).appendingPathComponent(safeName)
                 do {
@@ -207,6 +250,173 @@ extension MCPHandlers {
         }
 
         return try JSONValue.encoding(BulkAttachmentResult(saved: saved, errors: errors))
+    }
+
+    // MARK: — fetch_from_server
+
+    /// Ask Mail.app to pull a full message (body + attachments) back from
+    /// its IMAP/Gmail server, then return refreshed metadata — and optionally
+    /// write one attachment to disk in the same call. Use this when
+    /// `search_emails` shows `locally_available: false`, or after a
+    /// `get_attachment` returned `attachment_not_downloaded_locally`.
+    ///
+    /// Mechanism: `MailScripter.fetchBodies` runs Mail.app's AppleScript
+    /// `source of msg` trigger, which forces an IMAP refetch. Mail.app
+    /// materialises the bytes into its standard
+    /// `Attachments/<rowid>/<partIdx>/<file>` layout, which `BodyLoader`
+    /// already reads. We invalidate the loader cache and re-load until the
+    /// bytes appear (or the timeout elapses).
+    static func fetchFromServer(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
+        guard let obj = args.objectValue,
+              let rowid = obj["rowid"]?.intValue
+        else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "fetch_from_server: `rowid` (integer) is required"
+            )
+        }
+        let attIdx = obj["attachment_index"]?.intValue
+        let savePathRaw = obj["save_to_path"]?.stringValue?.trimmingCharacters(in: .whitespaces)
+        let timeoutSeconds = MCPHelpers.clampInt(
+            obj["timeout_seconds"]?.intValue ?? AttachmentDefaults.fetchTimeoutSeconds,
+            min: 1, max: AttachmentDefaults.maxFetchTimeoutSeconds
+        )
+
+        guard let msg = try await context.indexDB.loadMessage(rowid: rowid) else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "fetch_from_server: no message with rowid \(rowid)"
+            )
+        }
+        guard let mailbox = try await context.indexDB.loadMailbox(rowid: msg.mailboxRowId) else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.internalError,
+                message: "fetch_from_server: rowid \(rowid) has no resolvable mailbox"
+            )
+        }
+
+        // Pre-resolve the save path so we fail fast on a bad path before
+        // burning IMAP round-trips.
+        var savePath: String? = nil
+        if let raw = savePathRaw, !raw.isEmpty {
+            guard attIdx != nil else {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.invalidParams,
+                    message: "fetch_from_server: `save_to_path` requires `attachment_index`"
+                )
+            }
+            do { savePath = try safeAbsolutePath(raw) }
+            catch let err as PathSafetyError {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.invalidParams,
+                    message: "fetch_from_server: \(err.description)"
+                )
+            }
+        }
+
+        let refreshed = await refetchBody(
+            for: msg, mailbox: mailbox,
+            requiringAttachmentIndex: attIdx,
+            timeoutSeconds: TimeInterval(timeoutSeconds),
+            context: context
+        )
+
+        // Build the metadata view from whatever we have now (refreshed body
+        // when available, otherwise an empty list — caller sees materialised:
+        // false + the structured error).
+        let attachments: [AttachmentRef] = (refreshed?.attachments ?? []).map {
+            AttachmentRef(
+                name: $0.name, content_type: $0.contentType,
+                byte_count: $0.data.count, locally_available: !$0.data.isEmpty
+            )
+        }
+
+        guard let body = refreshed else {
+            return try JSONValue.encoding(FetchFromServerResult(
+                rowid: rowid, materialised: false, attachments: attachments,
+                saved: nil,
+                error: "Mail.app didn't deliver content for rowid \(rowid) within \(timeoutSeconds)s — check Mail.app is running and the account is online, then retry."
+            ))
+        }
+
+        // Optional same-call write of one attachment.
+        var saved: AttachmentSaved? = nil
+        if let attIdx, let savePath {
+            guard attIdx >= 0, attIdx < body.attachments.count else {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.invalidParams,
+                    message: "fetch_from_server: attachment_index \(attIdx) out of range — message has \(body.attachments.count) attachment(s)"
+                )
+            }
+            let att = body.attachments[attIdx]
+            guard !att.data.isEmpty else {
+                return try JSONValue.encoding(FetchFromServerResult(
+                    rowid: rowid, materialised: false, attachments: attachments, saved: nil,
+                    error: "fetch_from_server: attachment \(attIdx) ('\(att.name)') still empty after Mail.app fetch — the server may not have the bytes"
+                ))
+            }
+            do {
+                try writeAttachment(att.data, to: savePath)
+            } catch {
+                throw JSONRPCErrorPayload(
+                    code: JSONRPCErrorCode.internalError,
+                    message: "fetch_from_server: failed to write to \(savePath): \(error.localizedDescription)"
+                )
+            }
+            saved = AttachmentSaved(
+                rowid: rowid, attachment_index: attIdx,
+                name: att.name, content_type: att.contentType,
+                byte_count: att.data.count, saved_path: savePath
+            )
+        }
+
+        return try JSONValue.encoding(FetchFromServerResult(
+            rowid: rowid, materialised: true, attachments: attachments,
+            saved: saved, error: nil
+        ))
+    }
+
+    /// Trigger Mail.app to refetch this message's full source and poll the
+    /// BodyLoader until either the requested attachment (or any body bytes,
+    /// if no attachment was requested) materialises, or the deadline elapses.
+    /// Returns nil on timeout.
+    static func refetchBody(
+        for msg: MessageHeader,
+        mailbox: Mailbox,
+        requiringAttachmentIndex idx: Int?,
+        timeoutSeconds: TimeInterval,
+        context: MCPContext
+    ) async -> MessageBody? {
+        // Look up account email — Mail.app needs it to scope the message lookup
+        // efficiently (cross-account fallback works but is slow).
+        let accountEmail = (try? await context.indexDB.enrichForMCP(rowids: [msg.rowId]))?[msg.rowId]?.accountEmail
+        let entry = MailScripter.BatchEntry(
+            rfcMessageId: msg.rfcMessageId ?? "",
+            appleRowId: msg.rowId,
+            accountEmail: accountEmail,
+            mailboxPathComponents: mailbox.pathComponents
+        )
+        // Fire-and-forget: Mail.app runs in its own process, we poll the
+        // resulting on-disk changes via BodyLoader.
+        await MailScripter.fetchBodies([entry])
+
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var lastBody: MessageBody? = nil
+        while Date() < deadline {
+            await context.bodyLoader.invalidateAll()
+            if let body = try? await context.bodyLoader.loadBody(messageRowId: msg.rowId, mailbox: mailbox) {
+                lastBody = body
+                if let idx {
+                    if idx >= 0, idx < body.attachments.count, !body.attachments[idx].data.isEmpty {
+                        return body
+                    }
+                } else if !body.displayText.isEmpty || body.attachments.contains(where: { !$0.data.isEmpty }) {
+                    return body
+                }
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return lastBody  // may still be useful (caller checks attachments)
     }
 
     // MARK: — Helpers
@@ -294,6 +504,14 @@ enum AttachmentDefaults {
     /// unset. The base64 inflation pushes anything larger past most
     /// MCP-client per-call response caps.
     static let maxBase64Bytes = 10_000_000
+
+    /// Default timeout for `fetch_from_server` / `download_if_missing`
+    /// polling. A typical Gmail attachment fetch lands in 1–5s; we give a
+    /// generous default so a slow link doesn't fail spuriously.
+    static let fetchTimeoutSeconds = 30
+    /// Hard ceiling on the user-supplied `timeout_seconds`. Keeps MCP call
+    /// latency bounded; clients can always retry with a fresh window.
+    static let maxFetchTimeoutSeconds = 120
 }
 
 private extension BulkAttachmentRow {
