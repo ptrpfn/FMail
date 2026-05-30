@@ -466,8 +466,19 @@ enum MCPTools {
     // MARK: — search_emails description (the LLM-visible DSL grammar)
 
     private static let searchEmailsDescription: String = """
-    Search the FMail index using a query DSL. Returns matching messages
-    newest first. Drafts, trash, and junk are excluded.
+    **Full-text search across every indexed email** — subject, sender,
+    recipients, attachment filenames, and body content — newest first.
+    Drafts, trash, and junk are excluded by default; use `in:drafts` (etc.)
+    to scope to those explicitly. The DSL below supports boolean operators,
+    quoted phrases, and per-field operators so you can compose narrow
+    queries like "invoices from a vendor in March 2025 with a PDF attached"
+    in one call: `from:vendor.com subject:invoice after:2025-03
+    before:2025-04 attachment:pdf`.
+
+    Use this when the user wants to find email by any combination of
+    topic / person / time / mailbox / flag / attachment name. Use
+    `list_threads` instead when they want a chronological overview of
+    recent conversations rather than a targeted search.
 
     DSL GRAMMAR
     ===========

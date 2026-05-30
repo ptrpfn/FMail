@@ -14,6 +14,36 @@ enum MCPProtocol {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1"
     }
     static let mcpPath = "/mcp"
+
+    /// `instructions` returned from `initialize` — per the MCP spec, this is
+    /// the server's "what am I and how do you use me" string, intended for
+    /// the LLM/client to use as context when deciding which tools to call.
+    /// Lead with the headline capability (search) so connectors that surface
+    /// a short summary on first connection make it visible at a glance.
+    static let instructions: String = """
+    FMail exposes your local Apple Mail index over MCP, read-only.
+
+    Primary capability is **full-text search across every indexed email** —
+    subject, sender, recipients, attachment filenames, and body — via the
+    `search_emails` query DSL: boolean AND/OR/NOT, grouping, quoted phrases,
+    plus per-field operators (`from:`, `to:`, `cc:`, `subject:`, `body:`,
+    `attachment:`, `account:`, `in:`, `thread:`, `is:`, `has:`,
+    `before:`/`after:`/`on:`). Domain-style values work (e.g.
+    `from:savills.com`), date forms include ISO and relative (`7d`, `2w`,
+    `"last 30 days"`, month names).
+
+    Complementary tools: `list_threads` (per mailbox or all), `get_thread`
+    and `get_email` (full message contents with `body_format: "clean"` for
+    LLM-friendly bodies), `get_attachment` / `get_attachments_for_rowids`
+    (save bytes straight to disk; `download_if_missing: true` or the
+    standalone `fetch_from_server` will pull offloaded attachments back
+    from the IMAP/Gmail server), `list_accounts`, and
+    `find_unanswered_threads` (threads you sent that haven't been replied
+    to). Per-attachment `locally_available` flags tell you when bytes have
+    been offloaded by Apple Mail's "Optimise Mac Storage."
+
+    Composing, replying, and sending happen in Apple Mail, not here.
+    """
 }
 
 enum JSONRPCErrorCode {

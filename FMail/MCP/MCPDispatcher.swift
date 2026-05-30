@@ -81,8 +81,12 @@ actor MCPDispatcher {
     // MARK: — Method handlers
 
     private func handleInitialize(_ params: JSONValue?) -> JSONValue {
-        // We advertise tools support but no listChanged events (the registry
-        // is fixed at app boot).
+        // `instructions` is the MCP-spec slot for "what is this server and
+        // how do you use it" — claude.ai-style connectors surface a summary
+        // of it on first connection. We lead with the search capability so
+        // the LLM sees it at a glance rather than discovering it by digging
+        // through tools/list. We advertise tools support but no
+        // listChanged events (the registry is fixed at app boot).
         .object([
             "protocolVersion": .string(MCPProtocol.version),
             "capabilities": .object([
@@ -91,7 +95,8 @@ actor MCPDispatcher {
             "serverInfo": .object([
                 "name": .string(MCPProtocol.serverName),
                 "version": .string(MCPProtocol.serverVersion)
-            ])
+            ]),
+            "instructions": .string(MCPProtocol.instructions)
         ])
     }
 
