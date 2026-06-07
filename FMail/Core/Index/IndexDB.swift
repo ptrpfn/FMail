@@ -376,7 +376,7 @@ actor IndexDB {
         (m.thread_id = ? OR (m.thread_id = 0 AND m.apple_rowid = ?))
         """
 
-    /// Shared SELECT list for the 11 columns `decodeMessageHeader` expects,
+    /// Shared SELECT list for the 12 columns `decodeMessageHeader` expects,
     /// with the `m.` alias and the subject prefix already concatenated.
     /// Reused by `search`, `loadThreadMessages`, and `loadMessage` so the
     /// column order can't drift between query and decoder.
@@ -385,7 +385,8 @@ actor IndexDB {
         COALESCE(m.subject_prefix, '') || m.subject,
         m.sender_address, m.sender_display,
         m.date_sent, m.date_received,
-        m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
+        m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid,
+        m.has_attachment
         """
 
     /// Decode one `MessageHeader` from a row shaped like
@@ -402,12 +403,14 @@ actor IndexDB {
         let flagged = sqlite3_column_int(stmt, 8) != 0
         let rfcId = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
         let uid: Int? = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 10))
+        let hasAttachment = sqlite3_column_int(stmt, 11) != 0
         return MessageHeader(
             rowId: rowid, mailboxRowId: mboxId, subject: subject,
             senderAddress: sa, senderDisplay: sd,
             dateSent: ds > 0 ? Date(timeIntervalSince1970: TimeInterval(ds)) : nil,
             dateReceived: dr > 0 ? Date(timeIntervalSince1970: TimeInterval(dr)) : nil,
-            isRead: read, isFlagged: flagged, rfcMessageId: rfcId, imapUID: uid
+            isRead: read, isFlagged: flagged, hasAttachment: hasAttachment,
+            rfcMessageId: rfcId, imapUID: uid
         )
     }
 

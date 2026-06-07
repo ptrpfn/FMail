@@ -79,6 +79,31 @@ final class EnvelopeReadOnly {
     /// for why they're excluded from the mirror.
     private static let draftAutosaveType = 5
 
+    /// SQL `EXISTS` expression: true when a message has at least one *real*
+    /// file attachment, as opposed to only inline body images (the kind mail
+    /// clients embed in signatures). Apple's `attachments` table carries no
+    /// disposition flag, so we lean on the near-universal naming convention
+    /// for inline images — `imageNNN.<image-ext>` (Outlook/Apple Mail emit
+    /// exactly this). Anything else with a non-empty name counts as real.
+    /// Used to drive `has_attachment`, so `has:attachment` search and the
+    /// menu's "Has attachments" line both ignore signature decoration.
+    private static let hasRealAttachmentExpr = """
+        EXISTS(
+            SELECT 1 FROM attachments at
+            WHERE at.message = m.ROWID
+              AND at.name IS NOT NULL AND at.name != ''
+              AND NOT (
+                  lower(at.name) GLOB 'image[0-9]*'
+                  AND (
+                      lower(at.name) LIKE '%.png'  OR lower(at.name) LIKE '%.jpg'
+                   OR lower(at.name) LIKE '%.jpeg' OR lower(at.name) LIKE '%.gif'
+                   OR lower(at.name) LIKE '%.bmp'  OR lower(at.name) LIKE '%.tif'
+                   OR lower(at.name) LIKE '%.tiff'
+                  )
+              )
+        )
+        """
+
     init(path: String) throws {
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
         var handle: OpaquePointer?
@@ -314,7 +339,7 @@ final class EnvelopeReadOnly {
                COALESCE(a.comment, ''),
                m.date_sent, m.date_received,
                m.read, m.flagged,
-               EXISTS(SELECT 1 FROM attachments at WHERE at.message = m.ROWID),
+               \(Self.hasRealAttachmentExpr),
                mgd.message_id_header,
                m.remote_id
         FROM messages m

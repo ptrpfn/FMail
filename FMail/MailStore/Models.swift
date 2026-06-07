@@ -89,6 +89,8 @@ struct MessageHeader: Identifiable, Hashable {
     let dateReceived: Date?
     let isRead: Bool
     let isFlagged: Bool
+    let hasAttachment: Bool       // a *real* file attachment (inline signature
+                                  // images are filtered out at index time)
     let rfcMessageId: String?     // RFC 2822 Message-ID header (with angle brackets)
     let imapUID: Int?             // Apple Mail's per-mailbox IMAP UID; lets
                                   // AppleScript do O(1) `whose id is N` lookups
@@ -100,7 +102,7 @@ struct MessageHeader: Identifiable, Hashable {
             rowId: rowId, mailboxRowId: mailboxRowId, subject: subject,
             senderAddress: senderAddress, senderDisplay: senderDisplay,
             dateSent: dateSent, dateReceived: dateReceived,
-            isRead: isRead, isFlagged: isFlagged,
+            isRead: isRead, isFlagged: isFlagged, hasAttachment: hasAttachment,
             rfcMessageId: rfcMessageId, imapUID: imapUID
         )
     }

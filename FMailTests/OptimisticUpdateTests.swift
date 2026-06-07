@@ -12,7 +12,7 @@ final class OptimisticUpdateTests: XCTestCase {
             rowId: rowId, mailboxRowId: mailbox, subject: "s",
             senderAddress: "a@b.c", senderDisplay: "A",
             dateSent: nil, dateReceived: nil,
-            isRead: isRead, isFlagged: false,
+            isRead: isRead, isFlagged: false, hasAttachment: false,
             rfcMessageId: nil, imapUID: nil
         )
     }

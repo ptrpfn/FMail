@@ -31,6 +31,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let placeholderItem = NSMenuItem()
     private var emailItems: [NSMenuItem] = []
     private var emailRowViews: [MenuEmailRowView] = []
+    /// One date-group header slot sitting immediately above each email row.
+    /// Shown (with a label like "Today") only when its row opens a new group;
+    /// hidden otherwise. Pairing one header per row keeps the menu mutation to
+    /// title/`isHidden` toggles — the same in-place pattern the rest of the
+    /// menu relies on to avoid disturbing the embedded search field.
+    private var headerItems: [NSMenuItem] = []
+    private var headerViews: [MenuSectionHeaderView] = []
 
     // Cached query results backing the email rows.
     private var emails: [MessageHeader] = []
@@ -114,6 +121,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(placeholderItem)
 
         for _ in 0..<Self.maxEmails {
+            let header = NSMenuItem()
+            let headerView = MenuSectionHeaderView(width: Self.menuWidth)
+            header.view = headerView
+            header.isEnabled = false   // a label, never selectable/highlighted
+            header.isHidden = true
+            headerItems.append(header)
+            headerViews.append(headerView)
+            menu.addItem(header)
+
             let item = NSMenuItem()
             let row = MenuEmailRowView(width: Self.menuWidth)
             item.view = row
@@ -205,13 +221,26 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let visibleIds = Set(emails.map(\.rowId))
         selectedRowIds.formIntersection(visibleIds)
 
+        var prevGroup: String?
         for (i, item) in emailItems.enumerated() {
             if i < emails.count {
                 let msg = emails[i]
+                // Date-group header: show it only when this row opens a new
+                // group (the list is already newest-first).
+                let group = Self.dateGroupLabel(for: msg.dateReceived ?? msg.dateSent)
+                if group != prevGroup {
+                    headerViews[i].configure(title: group)
+                    headerItems[i].isHidden = false
+                } else {
+                    headerItems[i].isHidden = true
+                }
+                prevGroup = group
+
                 configure(row: emailRowViews[i], with: msg)
                 item.submenu = makeEmailActionsMenu(for: msg)
                 item.isHidden = false
             } else {
+                headerItems[i].isHidden = true
                 item.isHidden = true
                 item.submenu = nil
             }
@@ -290,6 +319,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         sub.addItem(.separator())
+        let subjectItem = NSMenuItem()
+        subjectItem.attributedTitle = subjectDetailTitle(for: msg)
+        subjectItem.isEnabled = false
+        sub.addItem(subjectItem)
         for line in detailLines(for: msg) {
             let detail = NSMenuItem(title: line, action: nil, keyEquivalent: "")
             detail.isEnabled = false
@@ -368,7 +401,28 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let date = msg.dateReceived ?? msg.dateSent {
             lines.append("Date: \(Self.dateFormatter.string(from: date))")
         }
+        // Only real file attachments reach here — inline signature images are
+        // filtered out when `has_attachment` is computed at index time.
+        if msg.hasAttachment {
+            lines.append("📎 Has attachments")
+        }
         return lines
+    }
+
+    /// Multi-line "Subject: …" title for the actions submenu, soft-wrapped so a
+    /// long subject stays readable (a plain menu item would truncate it). The
+    /// row above shows a one-line, sender-prefixed truncation; this is the full
+    /// text.
+    private func subjectDetailTitle(for msg: MessageHeader) -> NSAttributedString {
+        let subject = msg.subject.isEmpty ? "(no subject)" : msg.subject
+        let wrapped = Self.softWrap("Subject: \(subject)", width: 58)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        return NSAttributedString(string: wrapped, attributes: [
+            .font: NSFont.menuFont(ofSize: 0),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph,
+        ])
     }
 
     private func accountEmail(forMailbox mailboxRowId: Int) -> String? {
@@ -388,6 +442,48 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func truncate(_ s: String, to max: Int) -> String {
         s.count <= max ? s : String(s.prefix(max - 1)) + "…"
+    }
+
+    /// Soft-wrap on word boundaries to `width` columns, hard-breaking any single
+    /// word longer than the column budget. Returns the lines joined by "\n".
+    private static func softWrap(_ s: String, width: Int) -> String {
+        var lines: [String] = []
+        var current = ""
+        for word in s.split(separator: " ", omittingEmptySubsequences: false).map(String.init) {
+            var word = word
+            // A single over-long word: emit full-width chunks, keep the tail.
+            while word.count > width {
+                if !current.isEmpty { lines.append(current); current = "" }
+                lines.append(String(word.prefix(width)))
+                word = String(word.dropFirst(width))
+            }
+            if current.isEmpty {
+                current = word
+            } else if current.count + 1 + word.count <= width {
+                current += " " + word
+            } else {
+                lines.append(current)
+                current = word
+            }
+        }
+        if !current.isEmpty { lines.append(current) }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Bucket a message's date into a list separator label: "Today",
+    /// "Yesterday", an explicit "5 Jun 26" for the rest of the past week, then
+    /// a single "Older than a week" bucket. Future-dated mail (clock skew)
+    /// folds into "Today".
+    private static func dateGroupLabel(for date: Date?) -> String {
+        guard let date else { return "Unknown date" }
+        let cal = Calendar.current
+        let days = cal.dateComponents(
+            [.day], from: cal.startOfDay(for: date), to: cal.startOfDay(for: Date())
+        ).day ?? 0
+        if days <= 0 { return "Today" }
+        if days == 1 { return "Yesterday" }
+        if days <= 7 { return groupDateFormatter.string(from: date) }
+        return "Older than a week"
     }
 
     // MARK: — Actions
@@ -530,6 +626,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEE, MMM d, yyyy 'at' hh:mm:ss a"
+        return f
+    }()
+
+    /// Compact date for the list separators, e.g. "5 Jun 26".
+    private static let groupDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM yy"
         return f
     }()
 }
