@@ -22,6 +22,17 @@ struct IndexedMessage {
     let imapUID: Int?
 }
 
+/// A distinct sender you've received mail from — surfaced in the priority
+/// settings "add from recent" dropdown. `id` is the lowercased address so
+/// SwiftUI lists stay stable.
+struct RecentSender: Identifiable, Hashable, Sendable {
+    let address: String
+    let display: String
+    var id: String { address.lowercased() }
+    /// "Display <addr>" when a name is known, else just the address.
+    var label: String { display.isEmpty ? address : "\(display) <\(address)>" }
+}
+
 struct IndexedRecipient {
     let messageRowId: Int
     let kind: Int       // RecipientKind raw value (0=to, 1=cc, 2=bcc, 3=from)

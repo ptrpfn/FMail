@@ -16,17 +16,21 @@
 FMail lives entirely in the **menu bar**. There is no main window and no Dock icon. Click the
 envelope icon and a dropdown gives you:
 
-- Your **unread** messages (or **search results** when you type in the search box), each with an
-  unread dot and a checkbox.
-- **Mark all as read** and **Mark all as unread** — or tick a few rows and they become **Mark N as
-  read** / **Mark N as unread**. Whichever command would change nothing is disabled: if everything in
-  view (or everything ticked) is already read, "Mark as read" greys out, and vice-versa; a mix leaves
-  both active. (In the default unread-only list, "Mark as unread" is therefore disabled until you
-  search up some already-read messages.)
+- Your **unread** messages (or **search results** when you type in the search box), split into a
+  **Priority Messages** and an **Other Messages** block ([see below](#priority-vs-other-messages)) —
+  each newest-first with **Today / Yesterday / date** separators, and each row carrying an unread dot
+  and a checkbox.
+- Per-block **Mark all Priority/Other Messages as read** / **as unread** commands — or tick a few rows
+  and they collapse to **Mark N as read** / **Mark N as unread** acting on just the ticks. Whichever
+  command would change nothing is disabled: in the default unread-only list "as unread" greys out until
+  a search surfaces already-read mail. "Mark all" acts on *every* matching message in the block, not
+  only the rows currently visible.
 - A per-email **submenu** (click the title or the `›`): **Open in Mail**, **Reply**, **Reply All**,
-  **Forward**, plus the From / To / Date details.
+  **Forward**, then the full **subject**, the From / To / Date details, and a **📎 Has attachments**
+  line for messages with a real file attachment (inline signature images don't count).
 - An **MCP/Tunnel** submenu for the optional local MCP server and Cloudflare tunnel.
-- **Settings…** and **Quit**.
+- **Settings…** — a **Connection** tab (MCP / token / tunnel) and a **Priority Messages** tab — and
+  **Quit**.
 
 The menu-bar icon carries the global unread count as a badge.
 
@@ -41,6 +45,35 @@ sent by FMail; no SMTP, no sync layer, no cloud.
 > three-pane window app — sidebar, thread reader, in-app HTML rendering, per-contact preferred-address
 > handling — lives on the [`window-UI`](../../tree/window-UI) branch. Both read the same index.
 
+## Priority vs. Other messages
+
+The unread list — and every search result — is split into two blocks so the replies you're waiting on
+don't drown under newsletters, receipts and notifications:
+
+- **Priority Messages** — unread mail from senders you care about.
+- **Other Messages** — everything else.
+
+Within each block, rows are newest-first under **Today / Yesterday / "5 Jun 26" / "Older than a week"**
+date separators.
+
+A sender counts as **priority** when it is **either**:
+
+1. **Someone you've emailed** — derived automatically from your sent mail (anyone you put in To / Cc /
+   Bcc). The reasoning: if you wrote to them, you probably want to see the response. This auto-list is
+   maintained for you; you can't remove its entries.
+2. **On your supplemental list** — addresses or patterns you add by hand, for senders you only ever
+   *receive* from (a landlord's no-reply address, a service you never write back to, …).
+
+You manage the supplemental list under **Settings → Priority Messages**, which shows the auto-list
+greyed-out (non-removable) beneath your own editable entries. A supplemental entry can be a **full
+address** (exact match), a **bare word or domain** like `savills` or `ubs.com` (matches any address
+containing it), or an explicit **wildcard pattern** using `*` / `?` (e.g. `*@savills.com`). Add several
+at once separated by `;`, or pick from a **dropdown of the 20 most recent senders you've received
+from**.
+
+Each block carries its own **Mark all … as read / as unread** commands (acting on every matching
+message, not just the visible rows); per-row checkboxes still let you mark an arbitrary selection.
+
 ## Why
 
 Concrete Apple Mail pain points FMail targets:
@@ -50,6 +83,10 @@ Concrete Apple Mail pain points FMail targets:
    you open it.
 2. **Weak search.** No real boolean operators, awkward dates, no way to scope by topic + time +
    person at once. FMail's search box takes a structured query language (below).
+3. **Real replies buried under noise.** A busy unread list mixes the reply you're waiting on with
+   newsletters and receipts. FMail splits unread (and search results) into **Priority** and **Other**
+   blocks — priority = anyone you've emailed, plus a hand-edited allow-list — so the mail you actually
+   care about surfaces first ([details](#priority-vs-other-messages)).
 
 Surveyed alternatives (Mimestream, MailMate, Spark, Canary, Airmail, …) are either Gmail-only,
 subscription churn, cloud-routed (privacy), or carry the same bugs — and most get abandoned within a
@@ -67,8 +104,9 @@ the menu instead of waiting for a full sync.
 ## Search syntax
 
 The search box takes a structured query. Adjacent terms are AND-ed; everything composes freely with
-`AND` / `OR` / `NOT`, parens, and quoted phrases. Type a query and the email list becomes the results
-(up to 20 shown); clear it and the list returns to unread.
+`AND` / `OR` / `NOT`, parens, and quoted phrases. Type a query and the email list becomes the results —
+still split into **Priority** and **Other** blocks (up to 15 rows each); clear it and the list returns
+to unread.
 
 ### Operators
 
@@ -196,7 +234,7 @@ Read-only by design so it's safe to expose over a tunnel.
 
 - **Loopback, no token:** if no auth token is set and no tunnel is configured, the server serves
   unauthenticated on `127.0.0.1` only.
-- **Static bearer token:** set a token (Settings → Auth token → Generate) and every request must carry
+- **Static bearer token:** set a token (Settings → Connection → Auth token → Generate) and every request must carry
   `Authorization: Bearer <token>`. This is the credential the local Claude Code route uses.
 - **OAuth session tokens:** issued to remote clients (claude.ai connectors) via the approval flow.
 - **Fail-closed:** if a tunnel is configured but no token / session exists, the server refuses every
@@ -214,8 +252,8 @@ Read-only by design so it's safe to expose over a tunnel.
 This connects Claude Code on the same Mac to FMail over loopback, authenticated by the static token.
 
 1. **Turn the MCP server on** (it's on by default). In the menu: **MCP/Tunnel → MCP** should be
-   ticked. Optionally change the port in **Settings → MCP → Port** (default `8765`).
-2. **Generate an auth token.** **Settings → Auth token → Generate**, then **Copy**. (You can also read
+   ticked. Optionally change the port in **Settings → Connection → MCP → Port** (default `8765`).
+2. **Generate an auth token.** **Settings → Connection → Auth token → Generate**, then **Copy**. (You can also read
    it from `defaults read com.felixmatschke.FMail mcp.auth.token`.)
 3. **Add the server to Claude Code** with the token in an `Authorization` header. In your
    `~/.claude.json`, under the relevant project's `mcpServers`:
@@ -276,8 +314,8 @@ spawns `cloudflared` as a child process and tears it down when you close the tun
 
 ### B. Configure FMail
 
-6. **Settings → Auth token → Generate** (required — the tunnel refuses to open without it).
-7. **Settings → Tunnel:**
+6. **Settings → Connection → Auth token → Generate** (required — the tunnel refuses to open without it).
+7. **Settings → Connection → Tunnel:**
    - **Tunnel name** = `fmail` (the name from step 4)
    - **Public URL** = `https://fmail.your-domain.com` (the hostname from step 5)
    - **cloudflared path** — only if `cloudflared` isn't on the default `PATH`.
@@ -301,7 +339,7 @@ claude.ai's "Custom Connector" flow uses OAuth, not a static token:
 10. In claude.ai → add a custom connector → URL `https://fmail.your-domain.com/mcp`.
 11. claude.ai opens FMail's `/authorize` page in your browser — click **Approve** while the window is
     open. The issued session token is persisted, so the connector survives FMail restarts. To revoke a
-    paired connector later, use **Settings → Paired sessions → Revoke all paired sessions**.
+    paired connector later, use **Settings → Connection → Paired sessions → Revoke all paired sessions**.
 
 ### Who can connect over the tunnel
 
@@ -324,9 +362,9 @@ you actively grant during the window.
 
 Caveat — these are **bearer** tokens: whoever holds a valid one can use it until it expires (OAuth
 sessions last 30 days) or you revoke it. To cut off OAuth-paired clients immediately, use
-**Settings → Paired sessions → Revoke all paired sessions** — revocation is instant, and the next
+**Settings → Connection → Paired sessions → Revoke all paired sessions** — revocation is instant, and the next
 request from a revoked client gets a 401 and must re-authorize. To rotate the static token, generate a
-new one in **Settings → Auth token** (update your client configs to match). Treat the static token like
+new one in **Settings → Connection → Auth token** (update your client configs to match). Treat the static token like
 a password, and keep the tunnel closed when you're not using it.
 
 ### Threat model (worth being honest about)

@@ -33,6 +33,14 @@ actor IndexDB {
         }
         self.db = handle
         try Schema.apply(to: handle)
+        // Connection-scoped scratch tables holding the current "priority
+        // senders" set: exact lowercased addresses (`priority_addr`) and
+        // lowercased GLOB patterns like `*savills*` (`priority_pat`). Rebuilt by
+        // `updatePrioritySet`; joined against by the menu's Priority/Other
+        // split. Created here so the split queries can reference them before the
+        // first update.
+        try Schema.exec(handle, "CREATE TEMP TABLE IF NOT EXISTS priority_addr(addr TEXT PRIMARY KEY)")
+        try Schema.exec(handle, "CREATE TEMP TABLE IF NOT EXISTS priority_pat(pat TEXT PRIMARY KEY)")
     }
 
     deinit {

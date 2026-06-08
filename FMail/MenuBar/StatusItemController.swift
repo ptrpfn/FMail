@@ -16,31 +16,36 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
 
-    /// Max email rows shown — also the SQL LIMIT.
-    private static let maxEmails = 20
+    /// Max rows shown per block — also the per-block SQL LIMIT.
+    private static let maxPerBlock = 15
     private static let menuWidth: CGFloat = 460
 
     // Persistent items mutated on each open.
-    private let markAllItem = NSMenuItem()
-    private let markAllUnreadItem = NSMenuItem()
+    // Per-block "Mark all …" commands, shown when nothing is ticked.
+    private let markPriorityReadItem = NSMenuItem()
+    private let markPriorityUnreadItem = NSMenuItem()
+    private let markOtherReadItem = NSMenuItem()
+    private let markOtherUnreadItem = NSMenuItem()
+    // Selection commands, shown instead while one or more rows are ticked.
+    private let markSelReadItem = NSMenuItem()
+    private let markSelUnreadItem = NSMenuItem()
     private let mcpTunnelItem = NSMenuItem()
     private let mcpItem = NSMenuItem()
     private let tunnelOpenItem = NSMenuItem()
     private let approvalItem = NSMenuItem()
     private let searchView = MenuSearchFieldView(width: StatusItemController.menuWidth)
     private let placeholderItem = NSMenuItem()
-    private var emailItems: [NSMenuItem] = []
-    private var emailRowViews: [MenuEmailRowView] = []
-    /// One date-group header slot sitting immediately above each email row.
-    /// Shown (with a label like "Today") only when its row opens a new group;
-    /// hidden otherwise. Pairing one header per row keeps the menu mutation to
-    /// title/`isHidden` toggles — the same in-place pattern the rest of the
-    /// menu relies on to avoid disturbing the embedded search field.
-    private var headerItems: [NSMenuItem] = []
-    private var headerViews: [MenuSectionHeaderView] = []
 
-    // Cached query results backing the email rows.
-    private var emails: [MessageHeader] = []
+    /// The two list sections. Each is a "Priority/Other Messages" divider over a
+    /// pre-allocated pool of (date sub-header + row) pairs. Pairing one header
+    /// per row keeps menu mutation to title/`isHidden` toggles — the in-place
+    /// pattern that avoids disturbing the embedded search field.
+    private let priorityBlock = MenuBlock(width: StatusItemController.menuWidth, capacity: StatusItemController.maxPerBlock)
+    private let otherBlock = MenuBlock(width: StatusItemController.menuWidth, capacity: StatusItemController.maxPerBlock)
+
+    // Cached query results backing each block's rows.
+    private var priorityEmails: [MessageHeader] = []
+    private var otherEmails: [MessageHeader] = []
     private var currentSearchText = ""
     private var refreshTask: Task<Void, Never>?
 
@@ -74,15 +79,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        markAllItem.title = "Mark all as read"
-        markAllItem.target = self
-        markAllItem.action = #selector(markAllAsRead)
-        menu.addItem(markAllItem)
-
-        markAllUnreadItem.title = "Mark all as unread"
-        markAllUnreadItem.target = self
-        markAllUnreadItem.action = #selector(markAllAsUnread)
-        menu.addItem(markAllUnreadItem)
+        configureMarkItem(markPriorityReadItem, "Mark all Priority Messages as read", #selector(markPriorityRead))
+        configureMarkItem(markPriorityUnreadItem, "Mark all Priority Messages as unread", #selector(markPriorityUnread))
+        configureMarkItem(markOtherReadItem, "Mark all Other Messages as read", #selector(markOtherRead))
+        configureMarkItem(markOtherUnreadItem, "Mark all Other Messages as unread", #selector(markOtherUnread))
+        configureMarkItem(markSelReadItem, "Mark as read", #selector(markSelectionRead))
+        configureMarkItem(markSelUnreadItem, "Mark as unread", #selector(markSelectionUnread))
+        for item in [markPriorityReadItem, markPriorityUnreadItem,
+                     markOtherReadItem, markOtherUnreadItem,
+                     markSelReadItem, markSelUnreadItem] {
+            menu.addItem(item)
+        }
 
         // MCP + the (more sensitive) tunnel live together under one item so
         // the tunnel's running state is visible at the top level via the
@@ -120,24 +127,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         placeholderItem.isHidden = true
         menu.addItem(placeholderItem)
 
-        for _ in 0..<Self.maxEmails {
-            let header = NSMenuItem()
-            let headerView = MenuSectionHeaderView(width: Self.menuWidth)
-            header.view = headerView
-            header.isEnabled = false   // a label, never selectable/highlighted
-            header.isHidden = true
-            headerItems.append(header)
-            headerViews.append(headerView)
-            menu.addItem(header)
-
-            let item = NSMenuItem()
-            let row = MenuEmailRowView(width: Self.menuWidth)
-            item.view = row
-            item.isHidden = true
-            emailItems.append(item)
-            emailRowViews.append(row)
-            menu.addItem(item)
-        }
+        priorityBlock.addItems(to: menu)
+        otherBlock.addItems(to: menu)
 
         menu.addItem(.separator())
 
@@ -193,9 +184,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         refreshTask?.cancel()
         let query = currentSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         refreshTask = Task { @MainActor in
-            let results = await fetchEmails(query: query)
+            let split = await fetchSplit(query: query)
             if Task.isCancelled { return }
-            self.emails = results
+            self.priorityEmails = split.priority
+            self.otherEmails = split.other
             self.updateEmailItems()
             // Keep the menu-bar count in step with the list — recompute the
             // unread total from the same index state the rows came from, so
@@ -208,44 +200,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func fetchEmails(query: String) async -> [MessageHeader] {
-        guard let db = model.indexDB else { return [] }
+    /// The active source compiled for the DB: `is:unread` when the search field
+    /// is empty, otherwise the user's query.
+    private func compiledSource() -> CompiledQuery? {
+        let query = currentSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let source = query.isEmpty ? "is:unread" : query
         let compiled = Evaluator.compile(QueryParser.parse(source))
-        guard compiled.hasAnyConstraint else { return [] }
-        return (try? await db.search(compiled, limit: Self.maxEmails)) ?? []
+        return compiled.hasAnyConstraint ? compiled : nil
+    }
+
+    private func fetchSplit(query: String) async -> (priority: [MessageHeader], other: [MessageHeader]) {
+        guard let db = model.indexDB, let compiled = compiledSource() else { return ([], []) }
+        return (try? await db.searchSplitByPriority(compiled, limitPerBlock: Self.maxPerBlock)) ?? ([], [])
     }
 
     private func updateEmailItems() {
-        // Drop selections for rows no longer in the list (e.g. after refresh).
-        let visibleIds = Set(emails.map(\.rowId))
+        // Drop selections for rows no longer in either list (e.g. after refresh).
+        let visibleIds = Set((priorityEmails + otherEmails).map(\.rowId))
         selectedRowIds.formIntersection(visibleIds)
 
-        var prevGroup: String?
-        for (i, item) in emailItems.enumerated() {
-            if i < emails.count {
-                let msg = emails[i]
-                // Date-group header: show it only when this row opens a new
-                // group (the list is already newest-first).
-                let group = Self.dateGroupLabel(for: msg.dateReceived ?? msg.dateSent)
-                if group != prevGroup {
-                    headerViews[i].configure(title: group)
-                    headerItems[i].isHidden = false
-                } else {
-                    headerItems[i].isHidden = true
-                }
-                prevGroup = group
+        updateBlock(priorityBlock, title: "Priority Messages", emails: priorityEmails)
+        updateBlock(otherBlock, title: "Other Messages", emails: otherEmails)
 
-                configure(row: emailRowViews[i], with: msg)
-                item.submenu = makeEmailActionsMenu(for: msg)
-                item.isHidden = false
-            } else {
-                headerItems[i].isHidden = true
-                item.isHidden = true
-                item.submenu = nil
-            }
-        }
-        if emails.isEmpty {
+        if priorityEmails.isEmpty && otherEmails.isEmpty {
             placeholderItem.isHidden = false
             configurePlaceholder()
         } else {
@@ -257,33 +234,77 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         updateMarkItems()
     }
 
+    /// Fill one block's pre-allocated pool: show its divider, then a row per
+    /// message with a date sub-header at each new date group. The whole block
+    /// hides when it has no messages.
+    private func updateBlock(_ block: MenuBlock, title: String, emails: [MessageHeader]) {
+        guard !emails.isEmpty else { block.hideAll(); return }
+        block.headerView.configure(title: title)
+        block.headerItem.isHidden = false
+
+        var prevGroup: String?
+        for i in block.rowItems.indices {
+            guard i < emails.count else {
+                block.dateItems[i].isHidden = true
+                block.rowItems[i].isHidden = true
+                block.rowItems[i].submenu = nil
+                continue
+            }
+            let msg = emails[i]
+            // Date sub-header: shown only when this row opens a new group
+            // (each block is already newest-first).
+            let group = Self.dateGroupLabel(for: msg.dateReceived ?? msg.dateSent)
+            if group != prevGroup {
+                block.dateViews[i].configure(title: group)
+                block.dateItems[i].isHidden = false
+            } else {
+                block.dateItems[i].isHidden = true
+            }
+            prevGroup = group
+
+            configure(row: block.rowViews[i], with: msg)
+            block.rowItems[i].submenu = makeEmailActionsMenu(for: msg)
+            block.rowItems[i].isHidden = false
+        }
+    }
+
     private func configure(row: MenuEmailRowView, with msg: MessageHeader) {
         row.configure(title: rowTitle(for: msg), selected: selectedRowIds.contains(msg.rowId))
         row.onToggleSelect = { [weak self] in self?.toggleSelection(msg.rowId) }
     }
 
-    /// The messages a top-level mark command acts on: the ticked rows when any
-    /// are selected, otherwise every displayed row.
+    /// Displayed messages the user has ticked (across both blocks).
     private var actionableMessages: [MessageHeader] {
-        selectedRowIds.isEmpty ? emails : emails.filter { selectedRowIds.contains($0.rowId) }
+        (priorityEmails + otherEmails).filter { selectedRowIds.contains($0.rowId) }
     }
 
-    /// Top commands: "Mark all as read/unread" (acting on every displayed row)
-    /// when nothing is ticked, otherwise "Mark N as read/unread" (acting on the
-    /// ticks). Each command is disabled when it would be a no-op — i.e. when
-    /// the working set has nothing in the opposite state. A mixed set leaves
-    /// both enabled.
+    /// Top commands. With nothing ticked: the four per-block "Mark all …"
+    /// commands, each enabled only when its block has a message in the opposite
+    /// state. With rows ticked: a single "Mark N as read/unread" pair acting on
+    /// the ticks (the per-block commands hide). Either way, a command is
+    /// disabled when it would be a no-op.
     private func updateMarkItems() {
-        let set = actionableMessages
-        let hasUnread = set.contains { !$0.isRead }
-        let hasRead = set.contains { $0.isRead }
         let n = selectedRowIds.count
+        let selecting = n > 0
 
-        markAllItem.title = n > 0 ? "Mark \(n) as read" : "Mark all as read"
-        markAllItem.isEnabled = hasUnread
+        markSelReadItem.isHidden = !selecting
+        markSelUnreadItem.isHidden = !selecting
+        for item in [markPriorityReadItem, markPriorityUnreadItem, markOtherReadItem, markOtherUnreadItem] {
+            item.isHidden = selecting
+        }
 
-        markAllUnreadItem.title = n > 0 ? "Mark \(n) as unread" : "Mark all as unread"
-        markAllUnreadItem.isEnabled = hasRead
+        if selecting {
+            let set = actionableMessages
+            markSelReadItem.title = "Mark \(n) as read"
+            markSelReadItem.isEnabled = set.contains { !$0.isRead }
+            markSelUnreadItem.title = "Mark \(n) as unread"
+            markSelUnreadItem.isEnabled = set.contains { $0.isRead }
+        } else {
+            markPriorityReadItem.isEnabled = priorityEmails.contains { !$0.isRead }
+            markPriorityUnreadItem.isEnabled = priorityEmails.contains { $0.isRead }
+            markOtherReadItem.isEnabled = otherEmails.contains { !$0.isRead }
+            markOtherUnreadItem.isEnabled = otherEmails.contains { $0.isRead }
+        }
     }
 
     private func toggleSelection(_ rowId: Int) {
@@ -444,6 +465,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         s.count <= max ? s : String(s.prefix(max - 1)) + "…"
     }
 
+    private func configureMarkItem(_ item: NSMenuItem, _ title: String, _ action: Selector) {
+        item.title = title
+        item.target = self
+        item.action = action
+    }
+
     /// Soft-wrap on word boundaries to `width` columns, hard-breaking any single
     /// word longer than the column budget. Returns the lines joined by "\n".
     private static func softWrap(_ s: String, width: Int) -> String {
@@ -488,12 +515,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: — Actions
 
-    @objc private func markAllAsRead() { markActionable(isRead: true) }
-    @objc private func markAllAsUnread() { markActionable(isRead: false) }
+    @objc private func markPriorityRead() { markBlock(priority: true, isRead: true) }
+    @objc private func markPriorityUnread() { markBlock(priority: true, isRead: false) }
+    @objc private func markOtherRead() { markBlock(priority: false, isRead: true) }
+    @objc private func markOtherUnread() { markBlock(priority: false, isRead: false) }
+    @objc private func markSelectionRead() { markSelection(isRead: true) }
+    @objc private func markSelectionUnread() { markSelection(isRead: false) }
 
-    /// Flip the working set (ticked rows, or every displayed row) to `isRead`,
-    /// touching only the rows that actually need it.
-    private func markActionable(isRead: Bool) {
+    /// Flip *every* message in the given block (not just the visible rows) that
+    /// matches the active source and is in the opposite state. The rowids are
+    /// re-queried so "Mark all" really means all, even past the display cap.
+    private func markBlock(priority: Bool, isRead: Bool) {
+        guard let db = model.indexDB, let compiled = compiledSource() else { return }
+        selectedRowIds.removeAll()
+        Task { @MainActor in
+            let rowids = (try? await db.rowidsMatching(compiled, priority: priority, isRead: !isRead)) ?? []
+            guard !rowids.isEmpty else { return }
+            _ = await model.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
+            self.refreshEmails()
+            self.updateStatusBadge()
+        }
+    }
+
+    /// Flip the ticked rows to `isRead`, touching only those that need it.
+    private func markSelection(isRead: Bool) {
         let rowids = actionableMessages.filter { $0.isRead != isRead }.map(\.rowId)
         guard !rowids.isEmpty else { return }
         selectedRowIds.removeAll()
@@ -635,4 +680,62 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         f.dateFormat = "d MMM yy"
         return f
     }()
+}
+
+/// One list section ("Priority Messages" / "Other Messages") and its
+/// pre-allocated item pool: a block divider, then `capacity` (date sub-header +
+/// row) pairs. Items are created once and reused via `isHidden`/title toggles so
+/// the menu never tears views down mid-open. The owning controller drives the
+/// content; this type only owns the items and their menu placement.
+@MainActor
+final class MenuBlock {
+    let headerItem = NSMenuItem()
+    let headerView: MenuSectionHeaderView
+    private(set) var dateItems: [NSMenuItem] = []
+    private(set) var dateViews: [MenuSectionHeaderView] = []
+    private(set) var rowItems: [NSMenuItem] = []
+    private(set) var rowViews: [MenuEmailRowView] = []
+
+    init(width: CGFloat, capacity: Int) {
+        headerView = MenuSectionHeaderView(width: width, style: .block)
+        headerItem.view = headerView
+        headerItem.isEnabled = false
+        headerItem.isHidden = true
+
+        for _ in 0..<capacity {
+            let dateItem = NSMenuItem()
+            let dateView = MenuSectionHeaderView(width: width, style: .date)
+            dateItem.view = dateView
+            dateItem.isEnabled = false
+            dateItem.isHidden = true
+            dateItems.append(dateItem)
+            dateViews.append(dateView)
+
+            let rowItem = NSMenuItem()
+            let rowView = MenuEmailRowView(width: width)
+            rowItem.view = rowView
+            rowItem.isHidden = true
+            rowItems.append(rowItem)
+            rowViews.append(rowView)
+        }
+    }
+
+    /// Append the divider and every (date, row) pair to the menu, in order.
+    func addItems(to menu: NSMenu) {
+        menu.addItem(headerItem)
+        for i in rowItems.indices {
+            menu.addItem(dateItems[i])
+            menu.addItem(rowItems[i])
+        }
+    }
+
+    /// Hide the whole block (empty result).
+    func hideAll() {
+        headerItem.isHidden = true
+        for i in rowItems.indices {
+            dateItems[i].isHidden = true
+            rowItems[i].isHidden = true
+            rowItems[i].submenu = nil
+        }
+    }
 }

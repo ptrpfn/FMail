@@ -308,6 +308,7 @@ final class MailModel {
         }
         self.mailboxes = mboxes
         self.accounts = finalAccounts
+        await refreshPrioritySenders()
         do {
             self.allUnreadCount = try await db.countAllUnreadExcludingDrafts()
         } catch {
@@ -333,6 +334,24 @@ final class MailModel {
         if !searchQuery.isEmpty {
             updateSearch(searchQuery)
         }
+    }
+
+    /// Recompute the menu's "priority sender" set — everyone you've emailed
+    /// (auto-derived from sent mail) ∪ the hand-edited supplemental list — and
+    /// push it into the index's scratch table that backs the Priority/Other
+    /// split. Cheap to call; safe to invoke whenever the index or the settings
+    /// list changes.
+    func refreshPrioritySenders() async {
+        guard let db = indexDB else { return }
+        var exact = (try? await db.sentToAddresses()) ?? []
+        var patterns = Set<String>()
+        for entry in PriorityListSettings.supplementalAddresses {
+            switch PriorityListSettings.classify(entry) {
+            case .exact(let address): if !address.isEmpty { exact.insert(address) }
+            case .glob(let pattern):  if !pattern.isEmpty { patterns.insert(pattern) }
+            }
+        }
+        try? await db.updatePrioritySet(exact: Array(exact), patterns: Array(patterns))
     }
 
     func selectAllMailboxes() {

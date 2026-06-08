@@ -1,36 +1,55 @@
 import AppKit
 
-/// A date-group separator inside the status menu, hosted as a view-based,
-/// disabled `NSMenuItem`. A left-aligned label (e.g. "Today", "4 Jun 26") sits
-/// at the menu's content margin with a hairline rule filling the rest of the
-/// width — a lightweight section divider rather than a selectable row.
+/// A separator label inside the status menu, hosted as a view-based, disabled
+/// `NSMenuItem`. Two styles:
+///
+///   - `.block`: a prominent block divider ("Priority Messages" / "Other
+///     Messages") — a semibold label at the content margin with a hairline
+///     rule filling the rest of the width.
+///   - `.date`: a date sub-header nested inside a block ("Today", "4 Jun 26")
+///     — a smaller, indented, subdued label with no rule.
 final class MenuSectionHeaderView: NSView {
+    enum Style { case block, date }
+
     private let label = NSTextField(labelWithString: "")
     private let rule = NSBox()
 
-    init(width: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
+    init(width: CGFloat, style: Style) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: style == .block ? 24 : 20))
 
-        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        label.textColor = .secondaryLabelColor
+        switch style {
+        case .block:
+            label.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+            label.textColor = .labelColor
+        case .date:
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+            label.textColor = .secondaryLabelColor
+        }
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentHuggingPriority(.required, for: .horizontal)
         label.setContentCompressionResistancePriority(.required, for: .horizontal)
         addSubview(label)
 
-        rule.boxType = .separator   // system separator color, light/dark aware
-        rule.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(rule)
-
-        NSLayoutConstraint.activate([
+        // Block dividers extend a rule to the right of the label; date
+        // sub-headers are just an indented label.
+        let leading: CGFloat = style == .block ? 20 : 30
+        var constraints: [NSLayoutConstraint] = [
             widthAnchor.constraint(equalToConstant: width),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leading),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            rule.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
-            rule.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            rule.centerYAnchor.constraint(equalTo: centerYAnchor),
-            rule.heightAnchor.constraint(equalToConstant: 1),
-        ])
+        ]
+        if style == .block {
+            rule.boxType = .separator   // system separator color, light/dark aware
+            rule.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(rule)
+            constraints += [
+                rule.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+                rule.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+                rule.centerYAnchor.constraint(equalTo: centerYAnchor),
+                rule.heightAnchor.constraint(equalToConstant: 1),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
     }
 
     @available(*, unavailable)
