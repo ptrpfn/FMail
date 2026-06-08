@@ -179,26 +179,24 @@ final class ReadStatusController {
         guard !entries.isEmpty else { return }
 
         suppressSync(.beforeDispatch)
-        Task.detached { [weak model] in
+        // Fire-and-forget. `MailScripter` runs osascript on its own serial
+        // queue (see `runOsascript`), so awaiting it from this main-actor Task
+        // only *suspends* — there's no need to `Task.detached`, and detaching
+        // is exactly what made Swift 6 region isolation flag the non-Sendable
+        // `model` being sent into the `MainActor.run` closures. Touching
+        // `model` only here, on the main actor, sidesteps that.
+        Task { [weak model] in
             let result = await MailScripter.deleteBatch(entries)
             switch result {
             case .ok:
-                await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = nil
-                }
-                if let sc = await MainActor.run(body: { model?.syncCoordinator }) {
-                    await sc.runIncrementalSync()
-                }
+                model?.syncCoordinator?.skipSyncsUntil = nil
+                await model?.syncCoordinator?.runIncrementalSync()
             case .notFound:
-                await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
-                    model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
-                }
+                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
+                model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
             case .failed(let msg):
-                await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
-                    model?.bulkActionError = "Delete failed: \(msg)"
-                }
+                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
+                model?.bulkActionError = "Delete failed: \(msg)"
             }
         }
     }
@@ -342,22 +340,19 @@ final class ReadStatusController {
 
         suppressSync(.beforeDispatch)
 
-        Task.detached { [weak model] in
+        // Fire-and-forget on the main actor — see the note in
+        // `applyAndDispatchDelete`. The osascript runs off-thread inside
+        // `MailScripter`; `model` is only ever touched here on the main actor.
+        Task { [weak model] in
             let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
-            await MainActor.run {
-                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
-            }
+            model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(SkipWindow.afterDispatch.rawValue)
             switch result {
             case .ok:
                 break
             case .notFound:
-                await MainActor.run {
-                    model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may not have been downloaded yet, or Mail.app's mailbox layout doesn't match (try Tools → Diagnose Mail.app structure)."
-                }
+                model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may not have been downloaded yet, or Mail.app's mailbox layout doesn't match (try Tools → Diagnose Mail.app structure)."
             case .failed(let msg):
-                await MainActor.run {
-                    model?.bulkActionError = "Bulk Mark as Read failed: \(msg)"
-                }
+                model?.bulkActionError = "Bulk Mark as Read failed: \(msg)"
             }
         }
     }
